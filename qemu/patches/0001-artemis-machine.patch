@@ -1,0 +1,1006 @@
+diff -ruN a/hw/block/m25p80.c b/hw/block/m25p80.c
+--- a/hw/block/m25p80.c
++++ b/hw/block/m25p80.c
+@@ -821,6 +821,7 @@
+             }
+             break;
+         case MAN_WINBOND:
++        case MAN_GIGADEVICE:
+             if (s->len > 1) {
+                 s->quad_enable = !!(s->data[1] & 0x02);
+             }
+@@ -835,6 +836,7 @@
+     case WRSR2:
+         switch (get_man(s)) {
+         case MAN_WINBOND:
++        case MAN_GIGADEVICE:
+             s->quad_enable = !!(s->data[0] & 0x02);
+             break;
+         default:
+@@ -1103,10 +1105,13 @@
+     /* Dummy cycles modeled with bytes writes instead of bits */
+     switch (get_man(s)) {
+     case MAN_WINBOND:
+-    case MAN_GIGADEVICE:
+         s->needed_bytes += WINBOND_CONTINUOUS_READ_MODE_CMD_LEN;
+         s->needed_bytes += 4;
+         break;
++    case MAN_GIGADEVICE:
++        /* SPI1 sends the mode bits and dummy cycles together as a single byte. */
++        s->needed_bytes += WINBOND_CONTINUOUS_READ_MODE_CMD_LEN;
++        break;
+     case MAN_SPANSION:
+         s->needed_bytes += SPANSION_CONTINUOUS_READ_MODE_CMD_LEN;
+         s->needed_bytes += extract32(s->spansion_cr2v,
+@@ -1295,6 +1300,7 @@
+             s->state = STATE_COLLECTING_VAR_LEN_DATA;
+             break;
+         case MAN_WINBOND:
++        case MAN_GIGADEVICE:
+             s->needed_bytes = 2;
+             s->state = STATE_COLLECTING_VAR_LEN_DATA;
+             break;
+@@ -1321,6 +1327,7 @@
+ 
+         switch (get_man(s)) {
+         case MAN_WINBOND:
++        case MAN_GIGADEVICE:
+             s->needed_bytes = 1;
+             s->state = STATE_COLLECTING_DATA;
+             s->pos = 0;
+@@ -1500,6 +1507,7 @@
+             s->quad_enable = true;
+             break;
+         case MAN_WINBOND:
++        case MAN_GIGADEVICE:
+             s->data[0] = (!!s->quad_enable) << 1;
+             s->pos = 0;
+             s->len = 1;
+diff -ruN a/hw/meson.build b/hw/meson.build
+--- a/hw/meson.build
++++ b/hw/meson.build
+@@ -1,6 +1,7 @@
+ subdir('9pfs')
+ subdir('acpi')
+ subdir('adc')
++subdir('artemis')
+ subdir('audio')
+ subdir('block')
+ subdir('char')
+diff -ruN a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
+--- a/hw/misc/esp32s3_rtc_cntl.c
++++ b/hw/misc/esp32s3_rtc_cntl.c
+@@ -20,9 +20,44 @@
+ #include "hw/qdev-properties.h"
+ #include "hw/misc/esp32s3_reg.h"
+ #include "hw/misc/esp32s3_rtc_cntl.h"
++#include "hw/artemis/artemis.h"
++
++#define ART_SLP_TIMER0      0x04
++#define ART_SLP_TIMER1      0x08
++#define ART_STATE0          0x18
++#define ART_WAKEUP_STATE    0x3C
++#define ART_INT_ENA         0x40
++#define ART_INT_RAW         0x44
++#define ART_INT_ST          0x48
++#define ART_INT_CLR         0x4C
++#define ART_EXT_WAKEUP_CONF 0x64
++#define ART_DIG_PWC         0x90
++#define ART_EXT_WAKEUP1     0xE0
++#define ART_EXT_WAKEUP1_ST  0xE4
++#define ART_WAKEUP_CAUSE    0x130
++
++#define ART_SLEEP_EN        BIT(31)
++#define ART_DG_WRAP_PD_EN   BIT(31)
++#define ART_TIMER_ALARM_EN  BIT(16)
++#define ART_WAKEUP_ENA_S    15
++#define ART_INT_SLP_WAKEUP  BIT(0)
++#define ART_INT_MAIN_TIMER  BIT(10)
++#define ART_EXT1_LV         BIT(31)
++#define ART_EXT0_LV         BIT(30)
++#define ART_EXT1_SEL_M      0x3FFFFF
++
++/* RTC_IO_EXT_WAKEUP0_REG, selecting the EXT0 pad. */
++#define ART_RTCIO_EXT0_WORD (0xDC / 4)
++#define ART_RTCIO_EXT0_S    27
++
++#define ART_TRIG_EXT0  BIT(0)
++#define ART_TRIG_EXT1  BIT(1)
++#define ART_TRIG_GPIO  BIT(2)
++#define ART_TRIG_TIMER BIT(3)
+ 
+ static void esp32s3_rtc_update_cpu_stall(Esp32s3RtcCntlState* s);
+ static void esp32s3_rtc_update_clk(Esp32s3RtcCntlState* s);
++static void esp32s3_rtc_sleep_evaluate(Esp32s3RtcCntlState *s);
+ 
+ static uint64_t esp32s3_rtc_cntl_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+@@ -72,6 +107,16 @@
+     case A_RTC_CNTL_STORE7:
+         r = s->scratch_reg[(addr - A_RTC_CNTL_STORE4) / 4 + 4];
+         break;
++
++    case ART_INT_ST:
++        r = s->regs[ART_INT_RAW / 4] & s->regs[ART_INT_ENA / 4];
++        break;
++
++    default:
++        if (addr < sizeof(s->regs)) {
++            r = s->regs[addr / 4];
++        }
++        break;
+     }
+     return r;
+ }
+@@ -142,9 +187,125 @@
+     case A_RTC_CNTL_STORE7:
+         s->scratch_reg[(addr - A_RTC_CNTL_STORE4) / 4 + 4] = value;
+         break;
++
++    case ART_STATE0:
++        s->regs[addr / 4] = value & ~ART_SLEEP_EN;
++        if (value & ART_SLEEP_EN) {
++            s->deep_sleep = s->regs[ART_DIG_PWC / 4] & ART_DG_WRAP_PD_EN;
++            s->sleeping = true;
++            qemu_set_irq(s->sleep_stall, 1);
++            esp32s3_rtc_sleep_evaluate(s);
++        }
++        break;
++
++    case ART_INT_CLR:
++        s->regs[ART_INT_RAW / 4] &= ~value;
++        break;
++
++    default:
++        if (addr < sizeof(s->regs)) {
++            s->regs[addr / 4] = value;
++        }
++        break;
++    }
++}
++
++static uint64_t esp32s3_rtc_now_ticks(Esp32s3RtcCntlState *s)
++{
++    return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->time_base_ns,
++                    s->rtc_slowclk_freq, NANOSECONDS_PER_SECOND);
++}
++
++static void esp32s3_rtc_wake(Esp32s3RtcCntlState *s, uint32_t cause)
++{
++    s->sleeping = false;
++    timer_del(s->sleep_timer);
++    s->regs[ART_WAKEUP_CAUSE / 4] = cause;
++    qemu_set_irq(s->sleep_stall, 0);
++
++    if (s->deep_sleep) {
++        /* Waking from deep sleep is a reset that keeps RTC memory. */
++        s->reset_cause[0] = ESP32_DEEPSLEEP_RESET;
++        s->reset_cause[1] = ESP32_DEEPSLEEP_RESET;
++        qemu_irq_pulse(s->dig_reset_req);
++    } else {
++        s->regs[ART_INT_RAW / 4] |= ART_INT_SLP_WAKEUP;
+     }
+ }
+ 
++static void esp32s3_rtc_sleep_evaluate(Esp32s3RtcCntlState *s)
++{
++    uint32_t ena = s->regs[ART_WAKEUP_STATE / 4] >> ART_WAKEUP_ENA_S;
++    uint32_t conf = s->regs[ART_EXT_WAKEUP_CONF / 4];
++    uint32_t cause = 0;
++
++    if (!s->sleeping) {
++        return;
++    }
++
++    if (ena & ART_TRIG_GPIO && artemis_gpio_wakeup_pending(s->gpio)) {
++        cause |= ART_TRIG_GPIO;
++    }
++    if (ena & ART_TRIG_EXT1 &&
++        artemis_gpio_ext1_pending(s->gpio,
++                                  s->regs[ART_EXT_WAKEUP1 / 4] & ART_EXT1_SEL_M,
++                                  conf & ART_EXT1_LV)) {
++        cause |= ART_TRIG_EXT1;
++    }
++    if (ena & ART_TRIG_EXT0) {
++        uint32_t pad = s->gpio->rtcio[ART_RTCIO_EXT0_WORD] >> ART_RTCIO_EXT0_S;
++
++        if (artemis_gpio_get_level(s->gpio, pad & 0x1F) == !!(conf & ART_EXT0_LV)) {
++            cause |= ART_TRIG_EXT0;
++        }
++    }
++
++    if (ena & ART_TRIG_TIMER && s->regs[ART_SLP_TIMER1 / 4] & ART_TIMER_ALARM_EN) {
++        uint64_t target = (uint64_t)(s->regs[ART_SLP_TIMER1 / 4] & 0xFFFF) << 32 |
++                          s->regs[ART_SLP_TIMER0 / 4];
++        uint64_t now = esp32s3_rtc_now_ticks(s);
++
++        if (now >= target) {
++            cause |= ART_TRIG_TIMER;
++            s->regs[ART_INT_RAW / 4] |= ART_INT_MAIN_TIMER;
++        } else if (!cause) {
++            int64_t ns = muldiv64(target - now, NANOSECONDS_PER_SECOND,
++                                  s->rtc_slowclk_freq);
++            timer_mod(s->sleep_timer,
++                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns + 1);
++        }
++    }
++
++    if (cause) {
++        esp32s3_rtc_wake(s, cause);
++    }
++}
++
++static void esp32s3_rtc_sleep_timer_cb(void *opaque)
++{
++    esp32s3_rtc_sleep_evaluate(ESP32S3_RTC_CNTL(opaque));
++}
++
++void esp32s3_rtc_cntl_wake_check(void *opaque)
++{
++    esp32s3_rtc_sleep_evaluate(ESP32S3_RTC_CNTL(opaque));
++}
++
++void esp32s3_rtc_cntl_cancel_stall(Esp32s3RtcCntlState *s)
++{
++    s->options0_reg = FIELD_DP32(s->options0_reg, RTC_CNTL_OPTIONS0, SW_STALL_PROCPU_C0, 0);
++    s->options0_reg = FIELD_DP32(s->options0_reg, RTC_CNTL_OPTIONS0, SW_STALL_APPCPU_C0, 0);
++    s->sw_cpu_stall_reg = 0;
++    esp32s3_rtc_update_cpu_stall(s);
++}
++
++void esp32s3_rtc_cntl_cancel_sleep(Esp32s3RtcCntlState *s)
++{
++    s->sleeping = false;
++    timer_del(s->sleep_timer);
++    memset(s->regs, 0, sizeof(s->regs));
++}
++
+ static void esp32s3_rtc_update_cpu_stall(Esp32s3RtcCntlState* s)
+ {
+     uint32_t procpu_stall = (FIELD_EX32(s->sw_cpu_stall_reg, RTC_CNTL_SW_CPU_STALL, PROCPU_C1) << 2) |
+@@ -164,7 +325,7 @@
+ 
+ static void esp32s3_rtc_update_clk(Esp32s3RtcCntlState* s)
+ {
+-    const uint32_t slowclk_freq[] = {150000, 32768, 8000000/256};
++    const uint32_t slowclk_freq[] = {136000, 32768, 17500000/256};
+     const uint32_t fastclk_freq[] = {s->xtal_apb_freq / 4, 8000000};
+     s->rtc_slowclk_freq = slowclk_freq[s->rtc_slowclk];
+     s->rtc_fastclk_freq = fastclk_freq[s->rtc_fastclk];
+@@ -201,6 +362,8 @@
+     qdev_init_gpio_out_named(DEVICE(sbd), &s->cpu_reset_req[0], ESP32S3_RTC_CPU_RESET_GPIO, ESP32S3_CPU_COUNT);
+     qdev_init_gpio_out_named(DEVICE(sbd), &s->cpu_stall_req[0], ESP32S3_RTC_CPU_STALL_GPIO, ESP32S3_CPU_COUNT);
+     qdev_init_gpio_out_named(DEVICE(sbd), &s->clk_update, ESP32S3_RTC_CLK_UPDATE_GPIO, 1);
++    qdev_init_gpio_out_named(DEVICE(sbd), &s->sleep_stall, ESP32S3_RTC_SLEEP_STALL_GPIO, 1);
++    s->sleep_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32s3_rtc_sleep_timer_cb, s);
+ 
+     for (int i = 0; i < ESP32S3_CPU_COUNT; ++i) {
+         s->reset_cause[i] = ESP32_POWERON_RESET;
+diff -ruN a/hw/timer/esp_systimer.c b/hw/timer/esp_systimer.c
+--- a/hw/timer/esp_systimer.c
++++ b/hw/timer/esp_systimer.c
+@@ -22,7 +22,7 @@
+ #include "hw/timer/esp_systimer.h"
+ 
+ 
+-#define TICKS_TO_NS(ticks) (((ticks) / ESP_SYSTIMER_CNT_PER_US) * 1000)
++#define TICKS_TO_NS(ticks) (((ticks) * 1000 + ESP_SYSTIMER_CNT_PER_US - 1) / ESP_SYSTIMER_CNT_PER_US)
+ 
+ #define SYSTIMER_DEBUG      0
+ #define SYSTIMER_WARNING    0
+@@ -32,9 +32,10 @@
+  */
+ static void esp_systimer_update_counter(ESPSysTimerCounter *counter) {
+     const int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+-    const int64_t elapsed_ns = now - counter->base;
+-    const int64_t ticks = (elapsed_ns * (ESP_SYSTIMER_CNT_CLK / 1000000)) / 1000;
+-    counter->value = (counter->value + ticks) & ESP_SYSTIMER_52BIT_MASK;
++    /* Carry the fraction of a tick between updates, or the counter falls behind. */
++    const int64_t scaled = (now - counter->base) * ESP_SYSTIMER_CNT_PER_US + counter->fraction;
++    counter->value = (counter->value + scaled / 1000) & ESP_SYSTIMER_52BIT_MASK;
++    counter->fraction = scaled % 1000;
+     counter->base = now;
+ }
+ 
+diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
+--- a/hw/timer/esp_timg.c
++++ b/hw/timer/esp_timg.c
+@@ -210,7 +210,7 @@
+         /* Avoid any divide-by-0 error in the code below */
+         wdt->prescaler = 1;
+     } else {
+-        wdt->prescaler = FIELD_EX32(value, TIMG_WDTCONFIG1, CLK_PRESCALE);
++        wdt->prescaler = MAX(FIELD_EX32(value, TIMG_WDTCONFIG1, CLK_PRESCALE), 1);
+     }
+ 
+     /* Recalculate the frequency out of the new prescaler and current clock */
+@@ -264,7 +264,7 @@
+     const bool enabled = FIELD_EX32(value, TIMG_WDTCONFIG0, EN) ? true : false;
+     const bool enabled_changed = FIELD_EX32(former_conf, TIMG_WDTCONFIG0, EN) != enabled;
+ 
+-    if (FIELD_EX32(value, TIMG_WDTCONFIG0, CONF_UPDATE_EN)) {
++    {
+         /* If the prescaler value or the source clock changed update the timer */
+         if ((FIELD_EX32(wdt->prescaler_mirror, TIMG_WDTCONFIG1, CLK_PRESCALE) != wdt->prescaler) ||
+             (FIELD_EX32(former_conf, TIMG_WDTCONFIG0, USE_XTAL) != FIELD_EX32(value, TIMG_WDTCONFIG0, USE_XTAL)))
+@@ -278,11 +278,6 @@
+         wdt->stage_conf[2] = FIELD_EX32(value, TIMG_WDTCONFIG0, STG2);
+         wdt->stage_conf[3] = FIELD_EX32(value, TIMG_WDTCONFIG0, STG3);
+ 
+-        /* Update the stage values */
+-        for (int i = 0; i < ESP_WDT_STAGE_COUNT; i++) {
+-            /* Only reprogram the timer if the enable flag didn't change */
+-            esp_wdt_update_stage(wdt, i, wdt->stage_mirror[i], enabled && !enabled_changed);
+-        }
+     }
+ 
+     /* Check if the enabled bit changed */
+@@ -672,13 +667,21 @@
+             esp_wdt_update_config(&s->wdt, value);
+             break;
+         case A_TIMG_WDTCONFIG1:
+-            s->wdt.prescaler_mirror = value;
++            if (esp_wdt_is_writable(&s->wdt)) {
++                s->wdt.prescaler_mirror = value;
++                esp_wdt_update_prescaler(&s->wdt, value);
++            }
+             break;
+         case A_TIMG_WDTCONFIG2:
+         case A_TIMG_WDTCONFIG3:
+         case A_TIMG_WDTCONFIG4:
+         case A_TIMG_WDTCONFIG5:
+-            s->wdt.stage_mirror[(addr - A_TIMG_WDTCONFIG2) / sizeof(uint32_t)] = value;
++            if (esp_wdt_is_writable(&s->wdt)) {
++                const int stage = (addr - A_TIMG_WDTCONFIG2) / sizeof(uint32_t);
++
++                s->wdt.stage_mirror[stage] = value;
++                esp_wdt_update_stage(&s->wdt, stage, value, true);
++            }
+             break;
+         case A_TIMG_WDTFEED:
+             esp_wdt_feed(&s->wdt);
+@@ -747,10 +750,60 @@
+ };
+ 
+ 
++static int64_t esp_counter_freeze(ESPVirtualCounter *counter)
++{
++    int64_t remaining = -1;
++
++    if (timer_pending(&counter->timer)) {
++        remaining = MAX(timer_expire_time_ns(&counter->timer) -
++                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), 0);
++        timer_del(&counter->timer);
++    }
++    return remaining;
++}
++
++static void esp_counter_thaw(ESPVirtualCounter *counter, int64_t remaining)
++{
++    esp_virtual_counter_reenabled(counter);
++    if (remaining >= 0) {
++        timer_mod_ns(&counter->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + remaining);
++    }
++}
++
++void esp_timg_set_clock_gated(ESPTimgState *s, bool gated)
++{
++    ESPT0State *timers[] = { &s->t0, &s->t1 };
++
++    if (gated == s->clock_gated) {
++        return;
++    }
++    s->clock_gated = gated;
++
++    if (gated) {
++        for (int i = 0; i < ARRAY_SIZE(timers); i++) {
++            if (FIELD_EX32(timers[i]->config, TIMG_T0CONFIG, EN)) {
++                esp_t0_update_counter(timers[i]);
++            }
++            s->gated_remaining_ns[i] = esp_counter_freeze(&timers[i]->counter);
++        }
++        if (esp_wdt_enabled(&s->wdt)) {
++            esp_virtual_counter_update(&s->wdt.counter);
++        }
++        s->gated_remaining_ns[2] = esp_counter_freeze(&s->wdt.counter);
++    } else {
++        for (int i = 0; i < ARRAY_SIZE(timers); i++) {
++            esp_counter_thaw(&timers[i]->counter, s->gated_remaining_ns[i]);
++        }
++        esp_counter_thaw(&s->wdt.counter, s->gated_remaining_ns[2]);
++    }
++}
++
+ static void esp_timg_reset_hold(Object *obj, ResetType type)
+ {
+     ESPTimgState *s = ESP_TIMG(obj);
+ 
++    s->clock_gated = false;
++
+     /* Reset watchdog */
+     esp_virtual_counter_reset(&s->wdt.counter);
+     s->wdt.config0 = 0;
+diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
+--- a/hw/xtensa/esp32s3.c
++++ b/hw/xtensa/esp32s3.c
+@@ -69,6 +69,8 @@
+ 
+ #include "hw/misc/esp32c3_jtag.h"
+ #include "hw/display/esp_rgb.h"
++#include "hw/artemis/artemis.h"
++#include "chardev/char.h"
+ 
+ #define TYPE_ESP32S3_SOC "xtensa.esp32s3"
+ #define ESP32S3_SOC(obj) OBJECT_CHECK(Esp32s3SocState, (obj), TYPE_ESP32S3_SOC)
+@@ -122,7 +124,14 @@
+     XtensaCPU cpu[ESP32S3_CPU_COUNT];
+     Esp32s3IntMatrixState intmatrix;
+     ESP32S3UARTState uart[ESP32S3_UART_COUNT];
+-    ESP32S3GPIOState gpio;
++    ArtemisGpioState gpio;
++    ArtemisLedcState ledc;
++    ArtemisGpspiState gpspi[2];
++    ArtemisI2cState i2c[2];
++    ArtemisUsjState usj;
++    ArtemisSaradcState saradc;
++    ArtemisBoardState board;
++    ArtemisRadioState *radio;
+     Esp32s3RngState rng;
+     Esp32S3TWAIState twai;
+ 
+@@ -148,7 +157,6 @@
+     ESP32S3TimgState timg[2];
+     ESP32S3SysTimerState systimer;
+ 
+-    ESP32C3UsbJtagState jtag;
+     ESPRgbState rgb;
+ 
+     MemoryRegion iomem;
+@@ -157,6 +165,7 @@
+     SsiPsramState *psram;
+ 
+     uint32_t requested_reset;
++    bool clock_gated;
+ } Esp32s3SocState;
+ 
+ 
+@@ -182,7 +191,7 @@
+ {
+     Esp32s3SocState *s = ESP32S3_SOC(opaque);
+     if (level) {
+-        s->requested_reset = ESP32S3_SOC_RESET_DIG;
++        s->requested_reset |= ESP32S3_SOC_RESET_DIG;
+         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+     }
+ }
+@@ -191,7 +200,7 @@
+ {
+     Esp32s3SocState *s = ESP32S3_SOC(opaque);
+     if (level) {
+-        s->requested_reset = (n == 0) ? ESP32S3_SOC_RESET_PROCPU : ESP32S3_SOC_RESET_APPCPU;
++        s->requested_reset |= (n == 0) ? ESP32S3_SOC_RESET_PROCPU : ESP32S3_SOC_RESET_APPCPU;
+         /* Use different cause for APP CPU so that its reset doesn't cause QEMU to exit,
+          * when -no-reboot option is given.
+          */
+@@ -207,6 +216,7 @@
+         s->requested_reset = ESP32S3_SOC_RESET_ALL;
+     }
+     if (s->requested_reset & ESP32S3_SOC_RESET_PERIPH) {
++        esp32s3_rtc_cntl_cancel_stall(&s->rtc_cntl);
+         device_cold_reset(DEVICE(&s->intmatrix));
+         for (int i = 0; i < ESP32S3_UART_COUNT; ++i) {
+             device_cold_reset(DEVICE(&s->uart[i]));
+@@ -225,8 +235,70 @@
+     s->requested_reset = 0;
+ }
+ 
++/* A core stops while firmware stalls it or the whole chip is clock-gated. */
++static void esp32s3_update_stall(Esp32s3SocState *s, int n)
++{
++    bool stall = s->clock_gated || s->rtc_cntl.cpu_stall_state[n];
++
++    if (stall != s->cpu[n].env.runstall) {
++        xtensa_runstall(&s->cpu[n].env, stall);
++    }
++}
++
+ static void esp32s3_cpu_stall(void* opaque, int n, int level)
+ {
++    esp32s3_update_stall(ESP32S3_SOC(opaque), n);
++}
++
++static void esp32s3_gate_cores(Esp32s3SocState *s, bool gated)
++{
++    s->clock_gated = gated;
++    for (int i = 0; i < ESP32S3_CPU_COUNT; i++) {
++        esp32s3_update_stall(s, i);
++    }
++    for (int i = 0; i < ARRAY_SIZE(s->timg); i++) {
++        esp_timg_set_clock_gated(ESP_TIMG(&s->timg[i]), gated);
++    }
++}
++
++/* Light and deep sleep clock-gate both cores until a wakeup source fires. */
++static void esp32s3_sleep_stall(void *opaque, int n, int level)
++{
++    esp32s3_gate_cores(ESP32S3_SOC(opaque), level);
++}
++
++/* A watchdog's reset stage, on behalf of timer group n. */
++static void esp32s3_timg_wdt_reset(void *opaque, int n, int level)
++{
++    Esp32s3SocState *s = ESP32S3_SOC(opaque);
++
++    if (level) {
++        for (int i = 0; i < ESP32S3_CPU_COUNT; i++) {
++            s->rtc_cntl.reset_cause[i] = ESP32_TG0WDT_SYS_RESET + n;
++        }
++        s->requested_reset |= ESP32S3_SOC_RESET_DIG;
++        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
++    }
++}
++
++/* The watch's LDO: cutting it stops the chip, restoring it is a cold boot. */
++static void esp32s3_board_power(void *opaque, int n, int level)
++{
++    Esp32s3SocState *s = ESP32S3_SOC(opaque);
++
++    if (level) {
++        for (int i = 0; i < ESP32S3_CPU_COUNT; i++) {
++            s->rtc_cntl.reset_cause[i] = ESP32_POWERON_RESET;
++            s->rtc_cntl.stat_vector_sel[i] = true;
++        }
++        esp32s3_rtc_cntl_cancel_sleep(&s->rtc_cntl);
++        esp32s3_rtc_cntl_cancel_stall(&s->rtc_cntl);
++        esp32s3_gate_cores(s, false);
++        s->requested_reset = ESP32S3_SOC_RESET_ALL;
++        qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_UI);
++    } else {
++        esp32s3_gate_cores(s, true);
++    }
+ }
+ 
+ static void esp32s3_clk_update(void* opaque, int n, int level)
+@@ -313,6 +385,112 @@
+     }
+ }
+ 
++/* Everything on the watch that the stock SoC model doesn't cover. */
++static void esp32s3_artemis_init(Esp32s3SocState *ss, MemoryRegion *sys_mem,
++                                 DeviceState *intmatrix)
++{
++    static const hwaddr spi_base[] = { DR_REG_SPI2_BASE, DR_REG_SPI3_BASE };
++    static const int spi_irq[] = { ETS_SPI2_INTR_SOURCE, ETS_SPI3_INTR_SOURCE };
++    static const hwaddr i2c_base[] = { DR_REG_I2C_EXT_BASE, DR_REG_I2C1_EXT_BASE };
++    static const int i2c_irq[] = { ETS_I2C_EXT0_INTR_SOURCE, ETS_I2C_EXT1_INTR_SOURCE };
++    SysBusDevice *sbd;
++
++    /* LEDC */
++    sbd = SYS_BUS_DEVICE(&ss->ledc);
++    sysbus_realize(sbd, &error_fatal);
++    memory_region_add_subregion_overlap(sys_mem, DR_REG_LEDC_BASE,
++                                        sysbus_mmio_get_region(sbd, 0), 0);
++    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(intmatrix, ETS_LEDC_INTR_SOURCE));
++
++    /* GPIO matrix, IO_MUX, RTC_IO */
++    ss->gpio.ledc = &ss->ledc;
++    ss->ledc.notify = (ArtemisLedcNotify)artemis_gpio_refresh_outputs;
++    ss->ledc.notify_opaque = &ss->gpio;
++    sbd = SYS_BUS_DEVICE(&ss->gpio);
++    sysbus_realize(sbd, &error_fatal);
++    memory_region_add_subregion_overlap(sys_mem, DR_REG_GPIO_BASE,
++                                        sysbus_mmio_get_region(sbd, 0), 0);
++    memory_region_add_subregion_overlap(sys_mem, DR_REG_IO_MUX_BASE,
++                                        sysbus_mmio_get_region(sbd, 1), 0);
++    memory_region_add_subregion_overlap(sys_mem, DR_REG_RTCIO_BASE,
++                                        sysbus_mmio_get_region(sbd, 2), 0);
++    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(intmatrix, ETS_GPIO_INTR_SOURCE));
++    ss->rtc_cntl.gpio = &ss->gpio;
++    ss->gpio.wake_notify = esp32s3_rtc_cntl_wake_check;
++    ss->gpio.wake_notify_opaque = &ss->rtc_cntl;
++
++    /* SPI2 and SPI3; firmware can route either to the panel's pads. */
++    for (int i = 0; i < ARRAY_SIZE(ss->gpspi); i++) {
++        sbd = SYS_BUS_DEVICE(&ss->gpspi[i]);
++        ss->gpspi[i].gdma = ESP_GDMA(&ss->gdma);
++        qdev_prop_set_uint32(DEVICE(sbd), "gdma-periph", i ? GDMA_SPI3 : GDMA_SPI2);
++        sysbus_realize(sbd, &error_fatal);
++        memory_region_add_subregion_overlap(sys_mem, spi_base[i],
++                                            sysbus_mmio_get_region(sbd, 0), 0);
++        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(intmatrix, spi_irq[i]));
++    }
++    ss->gpspi[1].bus = ss->gpspi[0].bus;
++
++    /* I2C */
++    for (int i = 0; i < ARRAY_SIZE(ss->i2c); i++) {
++        sbd = SYS_BUS_DEVICE(&ss->i2c[i]);
++        sysbus_realize(sbd, &error_fatal);
++        memory_region_add_subregion_overlap(sys_mem, i2c_base[i],
++                                            sysbus_mmio_get_region(sbd, 0), 0);
++        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(intmatrix, i2c_irq[i]));
++    }
++
++    /* USB Serial/JTAG: the console */
++    sbd = SYS_BUS_DEVICE(&ss->usj);
++    qdev_prop_set_chr(DEVICE(sbd), "chardev", qemu_chr_find("artemis-usb"));
++    sysbus_realize(sbd, &error_fatal);
++    memory_region_add_subregion_overlap(sys_mem, DR_REG_USB_SERIAL_JTAG_BASE,
++                                        sysbus_mmio_get_region(sbd, 0), 0);
++    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(intmatrix, ETS_USB_SERIAL_JTAG_INTR_SOURCE));
++
++    /* SAR ADC */
++    sbd = SYS_BUS_DEVICE(&ss->saradc);
++    sysbus_realize(sbd, &error_fatal);
++    memory_region_add_subregion_overlap(sys_mem, DR_REG_SENS_BASE,
++                                        sysbus_mmio_get_region(sbd, 0), 0);
++
++    /* Radio register blocks */
++    ss->radio = ARTEMIS_RADIO(sysbus_create_simple(TYPE_ARTEMIS_RADIO, -1, NULL));
++    artemis_radio_map(ss->radio, sys_mem);
++
++    /* BLE core */
++    sbd = SYS_BUS_DEVICE(qdev_new(TYPE_ARTEMIS_BLE));
++    sysbus_realize_and_unref(sbd, &error_fatal);
++    memory_region_add_subregion_overlap(sys_mem, 0x60031000,
++                                        sysbus_mmio_get_region(sbd, 0), 0);
++    memory_region_add_subregion_overlap(sys_mem, 0x60042000,
++                                        sysbus_mmio_get_region(sbd, 1), 0);
++    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(intmatrix, ETS_RWBLE_INTR_SOURCE));
++
++    /* Board */
++    sbd = SYS_BUS_DEVICE(&ss->board);
++    qdev_prop_set_chr(DEVICE(sbd), "chardev", qemu_chr_find("artemis-bridge"));
++    sysbus_realize(sbd, &error_fatal);
++    qdev_connect_gpio_out_named(DEVICE(sbd), "power", 0,
++                                qdev_get_gpio_in_named(DEVICE(ss), "board-power", 0));
++
++    /* External chips. Their geometry and pinning follow the hardware revision. */
++    DeviceState *panel = qdev_new(TYPE_ARTEMIS_ST7735S);
++    if (ss->board.revision == 2) {
++        qdev_prop_set_uint32(panel, "gram-w", 132);
++        qdev_prop_set_uint32(panel, "gram-h", 132);
++        qdev_prop_set_uint32(panel, "glass-col", 2);
++        qdev_prop_set_uint32(panel, "glass-row", 1);
++    }
++    ssi_realize_and_unref(panel, ss->gpspi[0].bus, &error_fatal);
++
++    I2CSlave *imu = i2c_slave_create_simple(ss->i2c[0].bus, TYPE_ARTEMIS_LSM6DS3TRC, 0x6A);
++    I2CSlave *rtc = i2c_slave_create_simple(ss->i2c[0].bus, TYPE_ARTEMIS_BM8563, 0x51);
++
++    artemis_board_wire(&ss->board, &ss->gpio, &ss->saradc, ARTEMIS_ST7735S(panel),
++                       ARTEMIS_LSM6DS3TRC(imu), ARTEMIS_BM8563(rtc));
++}
++
+ struct Esp32s3MachineState {
+     MachineState parent;
+ 
+@@ -410,6 +588,8 @@
+                                 qdev_get_gpio_in_named(dev, ESP32S3_RTC_DIG_RESET_GPIO, 0));
+     qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32S3_RTC_CLK_UPDATE_GPIO, 0,
+                                 qdev_get_gpio_in_named(dev, ESP32S3_RTC_CLK_UPDATE_GPIO, 0));
++    qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32S3_RTC_SLEEP_STALL_GPIO, 0,
++                                qdev_get_gpio_in_named(dev, ESP32S3_RTC_SLEEP_STALL_GPIO, 0));
+     for (int i = 0; i < ms->smp.cpus; ++i) {
+         qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32S3_RTC_CPU_RESET_GPIO, i,
+                                     qdev_get_gpio_in_named(dev, ESP32S3_RTC_CPU_RESET_GPIO, i));
+@@ -545,6 +725,9 @@
+ 
+     qdev_init_gpio_in_named(DEVICE(s), esp32s3_dig_reset,  ESP32S3_RTC_DIG_RESET_GPIO, 1);
+     qdev_init_gpio_in_named(DEVICE(s), esp32s3_cpu_reset,  ESP32S3_RTC_CPU_RESET_GPIO, ESP32S3_CPU_COUNT);
++    qdev_init_gpio_in_named(DEVICE(s), esp32s3_sleep_stall, ESP32S3_RTC_SLEEP_STALL_GPIO, 1);
++    qdev_init_gpio_in_named(DEVICE(s), esp32s3_board_power, "board-power", 1);
++    qdev_init_gpio_in_named(DEVICE(s), esp32s3_timg_wdt_reset, "timg-wdt-reset", 2);
+     qdev_init_gpio_in_named(DEVICE(s), esp32s3_cpu_stall,  ESP32S3_RTC_CPU_STALL_GPIO, ESP32S3_CPU_COUNT);
+     qdev_init_gpio_in_named(DEVICE(s), esp32s3_clk_update, ESP32S3_RTC_CLK_UPDATE_GPIO, 1);
+ 
+@@ -625,9 +808,10 @@
+     memory_region_add_subregion(sys_mem, memmap[ESP32S3_MEMREGION_DRAM].base, dram);
+ 
+ 
++    /* Unmapped peripheral space reads as zero rather than faulting. */
+     memory_region_init_io(&ss->iomem, OBJECT(&ss->cpu[0]), &esp32s3_io_ops,
+-                          NULL, "esp32s3.iomem", 0xd1000);
+-    memory_region_add_subregion(sys_mem, ESP32S3_IO_START_ADDR, &ss->iomem);
++                          NULL, "esp32s3.iomem", 0x1000000);
++    memory_region_add_subregion_overlap(sys_mem, ESP32S3_IO_START_ADDR, &ss->iomem, -2);
+ 
+     // qdev_prop_set_chr(DEVICE(ss), "serial0", serial_hd(0));
+     // qdev_prop_set_chr(DEVICE(ss), "serial1", serial_hd(1));
+@@ -638,8 +822,15 @@
+     object_initialize_child(OBJECT(ss), "extmem", &ss->cache, TYPE_ESP32S3_CACHE);
+     object_initialize_child(OBJECT(ss), "spi1", &ss->spi1, TYPE_ESP32S3_SPI);
+     object_initialize_child(OBJECT(ss), "efuse", &ss->efuse, TYPE_ESP32S3_EFUSE);
+-    object_initialize_child(OBJECT(ss), "jtag", &ss->jtag, TYPE_ESP32C3_JTAG);
+-    object_initialize_child(OBJECT(ss), "gpio", &ss->gpio, TYPE_ESP32S3_GPIO);
++    object_initialize_child(OBJECT(ss), "gpio", &ss->gpio, TYPE_ARTEMIS_GPIO);
++    object_initialize_child(OBJECT(ss), "ledc", &ss->ledc, TYPE_ARTEMIS_LEDC);
++    object_initialize_child(OBJECT(ss), "gpspi2", &ss->gpspi[0], TYPE_ARTEMIS_GPSPI);
++    object_initialize_child(OBJECT(ss), "gpspi3", &ss->gpspi[1], TYPE_ARTEMIS_GPSPI);
++    object_initialize_child(OBJECT(ss), "i2c0", &ss->i2c[0], TYPE_ARTEMIS_I2C);
++    object_initialize_child(OBJECT(ss), "i2c1", &ss->i2c[1], TYPE_ARTEMIS_I2C);
++    object_initialize_child(OBJECT(ss), "usj", &ss->usj, TYPE_ARTEMIS_USJ);
++    object_initialize_child(OBJECT(ss), "saradc", &ss->saradc, TYPE_ARTEMIS_SARADC);
++    object_initialize_child(OBJECT(ss), "board", &ss->board, TYPE_ARTEMIS_BOARD);
+     object_initialize_child(OBJECT(ss), "rng", &ss->rng, TYPE_ESP32S3_RNG);
+ 
+     object_initialize_child(OBJECT(ss), "clock", &ss->clock, TYPE_ESP32S3_CLOCK);
+@@ -668,13 +859,6 @@
+     /* Initialize OpenCores Ethernet controller now sicne it requires the interrupt matrix */
+     esp32s3_init_openeth(ss);
+ 
+-    /* USB Serial JTAG realization */
+-    {
+-        sysbus_realize(SYS_BUS_DEVICE(&ss->jtag), &error_fatal);
+-        MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->jtag), 0);
+-        memory_region_add_subregion_overlap(sys_mem, DR_REG_USB_SERIAL_JTAG_BASE, mr, 0);
+-    }
+-
+     /* SPI1 controller (SPI Flash) */
+     {
+         ss->spi1.xts_aes = &ss->xts_aes;
+@@ -740,6 +924,8 @@
+         /* Connect the Watchdog interrupt line to the interrupt matrix */
+         qdev_connect_gpio_out_named(DEVICE(&ss->timg[0]), ESP32S3_WDT_IRQ_INTERRUPT, 0,
+                                     qdev_get_gpio_in(intmatrix_dev, ETS_TG0_WDT_LEVEL_INTR_SOURCE));
++        qdev_connect_gpio_out_named(DEVICE(&ss->timg[0]), ESP32S3_WDT_IRQ_RESET, 0,
++                                    qdev_get_gpio_in_named(DEVICE(ss), "timg-wdt-reset", 0));
+     }
+     {
+         sysbus_realize(SYS_BUS_DEVICE(&ss->timg[1]), &error_fatal);
+@@ -754,6 +940,8 @@
+         /* Connect the Watchdog interrupt line to the interrupt matrix */
+         qdev_connect_gpio_out_named(DEVICE(&ss->timg[1]), ESP32S3_WDT_IRQ_INTERRUPT, 0,
+                                     qdev_get_gpio_in(intmatrix_dev, ETS_TG1_WDT_LEVEL_INTR_SOURCE));
++        qdev_connect_gpio_out_named(DEVICE(&ss->timg[1]), ESP32S3_WDT_IRQ_RESET, 0,
++                                    qdev_get_gpio_in_named(DEVICE(ss), "timg-wdt-reset", 1));
+     }
+ 
+     /* System timer */
+@@ -768,13 +956,6 @@
+     }
+ 
+ 
+-    /* GPIO realization */
+-    {
+-        sysbus_realize(SYS_BUS_DEVICE(&ss->gpio), &error_fatal);
+-        MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->gpio), 0);
+-        memory_region_add_subregion_overlap(sys_mem, DR_REG_GPIO_BASE, mr, 0);
+-    }
+-
+     {
+         qdev_realize(DEVICE(&ss->rng), &ss->periph_bus, &error_fatal);
+         esp32s3_soc_add_periph_device(sys_mem, &ss->rng, ESP32S3_RNG_BASE);
+@@ -784,7 +965,8 @@
+ 
+     /* GDMA Realization */
+     {
+-        object_property_set_link(OBJECT(&ss->gdma), "soc_mr", OBJECT(dram), &error_abort);
++        /* System memory rather than DRAM only: display buffers may be anywhere. */
++        object_property_set_link(OBJECT(&ss->gdma), "soc_mr", OBJECT(sys_mem), &error_abort);
+         sysbus_realize(SYS_BUS_DEVICE(&ss->gdma), &error_fatal);
+         MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->gdma), 0);
+         memory_region_add_subregion_overlap(sys_mem, DR_REG_GDMA_BASE, mr, 0);
+@@ -870,7 +1052,8 @@
+     }
+ 
+     esp32s3_soc_add_unimp_device(sys_mem, "esp32s3.rmt", DR_REG_RMT_BASE, 0x1000);
+-    esp32s3_soc_add_unimp_device(sys_mem, "esp32s3.iomux", DR_REG_IO_MUX_BASE, 0x2000);
++
++    esp32s3_artemis_init(ss, sys_mem, intmatrix_dev);
+ 
+     
+     esp32s3_machine_init_sd(ss);
+diff -ruN a/hw/xtensa/esp32s3_clk.c b/hw/xtensa/esp32s3_clk.c
+--- a/hw/xtensa/esp32s3_clk.c
++++ b/hw/xtensa/esp32s3_clk.c
+@@ -88,6 +88,13 @@
+         case A_SYSTEM_CORE_1_CONTROL_1_REG:
+                 s->app_cpu_addr = (uint32_t)value;
+             break;
++        case A_SYSTEM_CPU_PER_CONF:
++            s->cpuperconf = value;
++            break;
++        case A_SYSTEM_SYSCLK_CONF:
++            /* The clock source and divider; the crystal frequency above is read-only. */
++            s->sysclk = (s->sysclk & ~0xFFF) | (value & 0xFFF);
++            break;
+         case A_SYSTEM_CPU_INTR_FROM_CPU_0:
+         case A_SYSTEM_CPU_INTR_FROM_CPU_1:
+         case A_SYSTEM_CPU_INTR_FROM_CPU_2:
+@@ -122,7 +129,7 @@
+ 
+     /* Divider for PLL clock and APB  frequency */
+     s->cpuperconf = (ESP32S3_PERIOD_SEL_80 << R_SYSTEM_CPU_PER_CONF_CPUPERIOD_SEL_SHIFT) |
+-                    (ESP32S3_FREQ_SEL_PLL_480 << R_SYSTEM_CPU_PER_CONF_PLL_FREQ_SEL_SHIFT);
++                    (1 << R_SYSTEM_CPU_PER_CONF_PLL_FREQ_SEL_SHIFT);
+ 
+     /* Initialize the IRQs */
+     s->levels = 0;
+diff -ruN a/hw/xtensa/esp32s3_intc.c b/hw/xtensa/esp32s3_intc.c
+--- a/hw/xtensa/esp32s3_intc.c
++++ b/hw/xtensa/esp32s3_intc.c
+@@ -26,20 +26,34 @@
+ 
+ #define IRQ_MAP(cpu, input) s->irq_map[cpu][input]
+ 
++static void esp32s3_intmatrix_update_output(Esp32s3IntMatrixState *s, int cpu, int out_index)
++{
++    int level = 0;
++
++    if (s->outputs[cpu] == NULL) {
++        return;
++    }
++    for (int source = 0; source < ESP32S3_INT_MATRIX_INPUTS; ++source) {
++        if (s->levels[source] && IRQ_MAP(cpu, source) == out_index) {
++            level = 1;
++            break;
++        }
++    }
++    for (int int_index = 0; int_index < s->cpu[cpu]->env.config->nextint; ++int_index) {
++        if (s->cpu[cpu]->env.config->extint[int_index] == out_index) {
++            qemu_set_irq(s->outputs[cpu][int_index], level);
++            break;
++        }
++    }
++}
++
+ static void esp32s3_intmatrix_irq_handler(void *opaque, int n, int level)
+ {
+     Esp32s3IntMatrixState *s = ESP32S3_INTMATRIX(opaque);
++
++    s->levels[n] = level;
+     for (int i = 0; i < ESP32S3_CPU_COUNT; ++i) {
+-        if (s->outputs[i] == NULL) {
+-            continue;
+-        }
+-        int out_index = IRQ_MAP(i, n);
+-        for (int int_index = 0; int_index < s->cpu[i]->env.config->nextint; ++int_index) {
+-            if (s->cpu[i]->env.config->extint[int_index] == out_index) {
+-                qemu_set_irq(s->outputs[i][int_index], level);
+-                break;
+-            }
+-        }
++        esp32s3_intmatrix_update_output(s, i, IRQ_MAP(i, n));
+     }
+ }
+ 
+@@ -72,7 +86,14 @@
+     Esp32s3IntMatrixState *s = ESP32S3_INTMATRIX(opaque);
+     uint8_t* map_entry = get_map_entry(s, addr);
+     if (map_entry != NULL) {
++        const uint8_t old_index = *map_entry;
++        const int cpu = (addr / sizeof(uint32_t)) / ESP32S3_INT_MATRIX_INPUTS;
++
+         *map_entry = value & 0x1f;
++        if (*map_entry != old_index) {
++            esp32s3_intmatrix_update_output(s, cpu, old_index);
++            esp32s3_intmatrix_update_output(s, cpu, *map_entry);
++        }
+     }
+ }
+ 
+diff -ruN a/include/hw/misc/esp32s3_rtc_cntl.h b/include/hw/misc/esp32s3_rtc_cntl.h
+--- a/include/hw/misc/esp32s3_rtc_cntl.h
++++ b/include/hw/misc/esp32s3_rtc_cntl.h
+@@ -22,6 +22,7 @@
+ #define ESP32S3_RTC_CPU_RESET_GPIO    "cpu-reset"
+ #define ESP32S3_RTC_CPU_STALL_GPIO    "cpu-stall"
+ #define ESP32S3_RTC_CLK_UPDATE_GPIO   "clk-update"
++#define ESP32S3_RTC_SLEEP_STALL_GPIO  "sleep-stall"
+ 
+ typedef enum Esp32s3ResetCause {
+     ESP32_POWERON_RESET = 1,
+@@ -58,6 +59,8 @@
+     ESP32_SLOW_CLK_8MD256 = 2
+ } Esp32s3SlowClkSel;
+ 
++#define ESP32S3_RTC_CNTL_REG_WORDS (0x200 / 4)
++
+ typedef struct Esp32s3RtcCntlState {
+     SysBusDevice parent_obj;
+ 
+@@ -67,8 +70,16 @@
+     qemu_irq cpu_reset_req[ESP32S3_CPU_COUNT];
+     qemu_irq cpu_stall_req[ESP32S3_CPU_COUNT];
+     qemu_irq clk_update;
++    qemu_irq sleep_stall;
+     bool cpu_stall_state[ESP32S3_CPU_COUNT];
+ 
++    /* Registers without special behaviour, indexed by offset / 4. */
++    uint32_t regs[ESP32S3_RTC_CNTL_REG_WORDS];
++    struct ArtemisGpioState *gpio;
++    QEMUTimer *sleep_timer;
++    bool sleeping;
++    bool deep_sleep;
++
+     uint32_t xtal_apb_freq;
+     uint32_t pll_apb_freq;
+     Esp32s3SocClkSel soc_clk;
+@@ -126,3 +137,10 @@
+ REG32(RTC_CNTL_DATE,   0x1fc)
+ 
+ #define ESP32S3_RTC_CNTL_SIZE (A_RTC_CNTL_DATE + 4)
++
++/* Re-evaluate sleep wakeup conditions: a pad level may have changed. */
++void esp32s3_rtc_cntl_wake_check(void *opaque);
++/* Forget a sleep in progress, for when power was cut during it. */
++void esp32s3_rtc_cntl_cancel_sleep(Esp32s3RtcCntlState *s);
++/* A system reset releases cores that firmware had stalled. */
++void esp32s3_rtc_cntl_cancel_stall(Esp32s3RtcCntlState *s);
+diff -ruN a/include/hw/timer/esp_systimer.h b/include/hw/timer/esp_systimer.h
+--- a/include/hw/timer/esp_systimer.h
++++ b/include/hw/timer/esp_systimer.h
+@@ -76,6 +76,7 @@
+     uint64_t flushed; // Mirror of the internal counter that can be seen by the guest program
+     /* Absolute time, in ns, when value was updated last */
+     int64_t base;
++    int64_t fraction;
+ } ESPSysTimerCounter;
+ 
+ 
+diff -ruN a/include/hw/timer/esp_timg.h b/include/hw/timer/esp_timg.h
+--- a/include/hw/timer/esp_timg.h
++++ b/include/hw/timer/esp_timg.h
+@@ -48,7 +48,7 @@
+ #define ESP_RC_SLOW_FREQ        136000
+ #define ESP_RC_FAST_FREQ        17500000
+ #define ESP_RC_FAST_DIV_FREQ    (ESP_RC_FAST_FREQ / 256)
+-#define ESP_XTAL32K_FREQ        32000
++#define ESP_XTAL32K_FREQ        32768
+ 
+ 
+ /**
+@@ -158,8 +158,14 @@
+ 
+     /* Property used to disable the watchdog from command line */
+     bool wdt_disable;
++
++    /* What each counter (T0, T1, WDT) had left when the clock stopped, or -1. */
++    int64_t gated_remaining_ns[3];
++    bool clock_gated;
+ } ESPTimgState;
+ 
++void esp_timg_set_clock_gated(ESPTimgState *s, bool gated);
++
+ 
+ typedef struct ESPTimgClass {
+     SysBusDeviceClass parent_class;
+diff -ruN a/include/hw/xtensa/esp32s3_intc.h b/include/hw/xtensa/esp32s3_intc.h
+--- a/include/hw/xtensa/esp32s3_intc.h
++++ b/include/hw/xtensa/esp32s3_intc.h
+@@ -142,6 +142,7 @@
+     MemoryRegion iomem;
+     qemu_irq *outputs[ESP32S3_CPU_COUNT];
+     uint8_t irq_map[ESP32S3_CPU_COUNT][ESP32S3_INT_MATRIX_INPUTS];
++    uint8_t levels[ESP32S3_INT_MATRIX_INPUTS];
+ 
+     /* properties */
+     XtensaCPU *cpu[ESP32S3_CPU_COUNT];
+diff -ruN a/system/physmem.c b/system/physmem.c
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -587,6 +587,11 @@
+     bool active;
+ } TCGIOMMUNotifier;
+ 
++static void tcg_iommu_flush_work(CPUState *cpu, run_on_cpu_data data)
++{
++    tlb_flush(cpu);
++}
++
+ static void tcg_iommu_unmap_notify(IOMMUNotifier *n, IOMMUTLBEntry *iotlb)
+ {
+     TCGIOMMUNotifier *notifier = container_of(n, TCGIOMMUNotifier, n);
+@@ -594,7 +599,11 @@
+     if (!notifier->active) {
+         return;
+     }
+-    tlb_flush(notifier->cpu);
++    if (qemu_cpu_is_self(notifier->cpu)) {
++        tlb_flush(notifier->cpu);
++    } else {
++        async_run_on_cpu(notifier->cpu, tcg_iommu_flush_work, RUN_ON_CPU_NULL);
++    }
+     notifier->active = false;
+     /* We leave the notifier struct on the list to avoid reallocating it later.
+      * Generally the number of IOMMUs a CPU deals with will be small.
