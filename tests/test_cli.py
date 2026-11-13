@@ -193,9 +193,9 @@ def test_emulator_does_not_outlive_the_command(tmp_path, signum):
 
 
 def test_window_opens_and_closes_cleanly(tmp_path):
-    env = dict(os.environ, SDL_VIDEODRIVER="dummy", SDL_AUDIODRIVER="dummy")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
     shot = tmp_path / "window.png"
-    result = emu("stock", "--timeout", "3", "--screenshot", str(shot), env=env)
+    result = emu("stock", "--mute", "--timeout", "3", "--screenshot", str(shot), env=env)
     assert result.returncode == 0, result.stderr
     assert is_png(shot)
 

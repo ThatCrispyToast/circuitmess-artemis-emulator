@@ -1,539 +1,585 @@
-"""The watch on your desktop: display, lever, button, LEDs, buzzer and sensors."""
+"""The watch on your desktop: its display and LEDs, with ordinary controls for the rest."""
 
 from __future__ import annotations
 
 import array
 import math
 import os
+import signal
+import subprocess
+import sys
+import threading
 import time
-from dataclasses import dataclass
 from typing import Callable, Optional
 
-# Keeps the window title honest and pygame quiet on the terminal we share with firmware.
-os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+from PySide6.QtCore import QRect, Qt, QTimer, qInstallMessageHandler
+from PySide6.QtGui import QColor, QImage, QPainter, QPalette
+from PySide6.QtWidgets import (
+    QAbstractButton,
+    QApplication,
+    QCheckBox,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLayout,
+    QMainWindow,
+    QPushButton,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
+)
 
-import pygame  # noqa: E402
+from .image import save_png
+from .machine import LCD_HEIGHT, LCD_WIDTH, Watch
 
-from .image import save_png  # noqa: E402
-from .machine import LCD_HEIGHT, LCD_WIDTH, Watch  # noqa: E402
+# The LEDs around the display: 1, 2, 5 and 6 are ice blue, 3 and 4 orange.
+LED_COLORS = [(120, 225, 255), (120, 225, 255), (255, 150, 30), (255, 150, 30),
+              (120, 225, 255), (120, 225, 255)]
 
-BACKGROUND = (24, 26, 30)
-PANEL = (34, 37, 43)
-PANEL_EDGE = (58, 62, 70)
-TEXT = (226, 228, 232)
-TEXT_DIM = (150, 155, 165)
-ACCENT = (255, 118, 20)
-CASE = (196, 204, 210)
-CASE_EDGE = (150, 158, 166)
-PCB = (22, 24, 26)
-STRAP = (16, 16, 18)
-METAL = (176, 180, 184)
-
-LED_ICE_BLUE = (120, 225, 255)
-LED_ORANGE = (255, 150, 30)
-
-PANEL_WIDTH = 300
-MARGIN = 16
-STRAP_HEIGHT = 56
-PCB_WIDTH = 176
+BATTERY_MV = (3200, 4200)
+TILT_STEP = 10
 
 
-def _lit(color: tuple[int, int, int], amount: float) -> tuple[int, int, int]:
-    off = 42
-    return tuple(int(off + (c - off) * amount) for c in color)
+def _qt_message(kind, context, message: str) -> None:
+    """Qt's messages as it would print them, less those about media back ends not used here."""
+    category = context.category or "default"
+    if category.startswith("qt.multimedia") or message.startswith("No QtMultimedia backends"):
+        return
+    print(message if category == "default" else f"{category}: {message}", file=sys.stderr)
 
 
 class Buzzer:
     """Plays what's on the piezo's pin as a square wave."""
 
     RATE = 44100
+    # How much sound is kept queued: enough to bridge two refreshes of the window.
+    AHEAD = RATE * 2 * 40 // 1000
+    # Asks for the sound card, as opening it does. A sound server that is there and
+    # not answering keeps Qt waiting half a minute, so another process waits instead.
+    PROBE = ("import sys\n"
+             "from PySide6.QtCore import QCoreApplication\n"
+             "from PySide6.QtMultimedia import QMediaDevices\n"
+             "app = QCoreApplication([])\n"
+             "sys.exit(QMediaDevices.defaultAudioOutput().isNull())\n")
+    PROBE_SECONDS = 5.0
 
     def __init__(self, enabled: bool = True):
         self.muted = not enabled
         self.available = False
-        self._channel = None
+        self._sink = None
+        self._device = None
+        self._probe: Optional[subprocess.Popen] = None
+        self._probe_until = 0.0
+        self._asked = False
         self._freq = 0
-        self._cache: dict[int, pygame.mixer.Sound] = {}
-        if enabled:
-            try:
-                pygame.mixer.init(self.RATE, -16, 1, 512)
-                self.available = True
-            except pygame.error:
-                pass
+        self._phase = 0.0
 
-    def _sound(self, freq: int) -> pygame.mixer.Sound:
-        if freq not in self._cache:
-            period = self.RATE / freq
-            periods = max(1, round(2048 / period))
-            samples = array.array("h")
-            for i in range(int(periods * period)):
-                samples.append(6000 if (i / period) % 1 < 0.5 else -6000)
-            if len(self._cache) > 256:
-                self._cache.clear()
-            self._cache[freq] = pygame.mixer.Sound(buffer=samples.tobytes())
-        return self._cache[freq]
+    def _find_output(self) -> None:
+        """Opens the sound card once the probe has found one, without ever waiting."""
+        if not self._asked:
+            self._asked = True
+            self._probe_until = time.monotonic() + self.PROBE_SECONDS
+            try:
+                self._probe = subprocess.Popen(
+                    [sys.executable, "-c", self.PROBE],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+        if self._probe is None:
+            return
+        found = self._probe.poll()
+        if found is None:
+            if time.monotonic() < self._probe_until:
+                return
+            print("No sound: the sound server isn't answering.", file=sys.stderr, flush=True)
+        self.close()
+        if found == 0:
+            self._open()
+
+    def _open(self) -> None:
+        try:
+            from PySide6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
+
+            output = QMediaDevices.defaultAudioOutput()
+            if not output.isNull():
+                sound = QAudioFormat()
+                sound.setSampleRate(self.RATE)
+                sound.setChannelCount(1)
+                sound.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+                self._sink = QAudioSink(output, sound)
+                self._sink.setBufferSize(4 * self.AHEAD)
+                self._device = self._sink.start()
+                self.available = self._device is not None
+        except (ImportError, RuntimeError):
+            pass
+
+    def close(self) -> None:
+        """Ends the probe, if it is still going."""
+        if self._probe is not None:
+            if self._probe.poll() is None:
+                self._probe.kill()
+            self._probe.wait()
+            self._probe = None
 
     def set(self, freq: int, duty: float) -> None:
-        if not self.available:
+        audible = not self.muted and 20 <= freq <= 20000 and duty > 0
+        self._freq = freq if audible else 0
+
+    def pump(self) -> None:
+        """Tops up what the sound card has queued. Called at every refresh."""
+        if not self.available and not self.muted:
+            self._find_output()
+        if not self.available or not self._freq:
             return
-        if self.muted or not 20 <= freq <= 20000 or duty <= 0:
-            if self._channel:
-                self._channel.stop()
-            self._freq = 0
+        queued = self._sink.bufferSize() - self._sink.bytesFree()
+        count = (self.AHEAD - queued) // 2
+        if count <= 0:
             return
-        if freq != self._freq:
-            if self._channel:
-                self._channel.stop()
-            self._channel = self._sound(freq).play(loops=-1)
-            self._freq = freq
+        step = self._freq / self.RATE
+        phase = self._phase
+        samples = array.array("h", (6000 if (phase + i * step) % 1 < 0.5 else -6000
+                                    for i in range(count)))
+        self._phase = (phase + count * step) % 1
+        self._device.write(samples.tobytes())
 
 
-@dataclass
-class _Button:
-    label: str
-    rect: pygame.Rect
-    action: Callable[[], None]
-    active: Callable[[], bool] = lambda: False
+class Display(QWidget):
+    """The LCD, enlarged without smoothing and dimmed by its backlight."""
+
+    BORDER = 6
+
+    def __init__(self, watch: Watch, scale: int):
+        super().__init__()
+        self.watch = watch
+        self.lcd = QRect(self.BORDER, self.BORDER, LCD_WIDTH * scale, LCD_HEIGHT * scale)
+        self.setFixedSize(self.lcd.width() + 2 * self.BORDER, self.lcd.height() + 2 * self.BORDER)
+        self._seen = -1
+        self._frame = b""
+        self._image: Optional[QImage] = None
+
+    def refresh(self) -> None:
+        state = self.watch.state
+        if state.frame and state.frame_seq != self._seen:
+            self._seen = state.frame_seq
+            # QImage draws from this buffer, so it has to stay alive alongside it.
+            self._frame = bytes(state.frame)
+            self._image = QImage(self._frame, LCD_WIDTH, LCD_HEIGHT, LCD_WIDTH * 2,
+                                 QImage.Format.Format_RGB16)
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), Qt.GlobalColor.black)
+        if not self.watch.state.powered:
+            painter.setPen(QColor(110, 110, 110))
+            painter.drawText(self.lcd, Qt.AlignmentFlag.AlignCenter,
+                             "Powered off\nPress the side button to turn it on")
+            return
+        if self._image is None:
+            return
+        painter.drawImage(self.lcd, self._image)
+        brightness = self.watch.backlight
+        if brightness < 0.995:
+            # The panel's image stays faintly visible with the backlight off.
+            shade = int(255 * (1 - max(brightness, 0.02)) ** 1.5)
+            painter.fillRect(self.lcd, QColor(0, 0, 0, shade))
 
 
-class WatchWindow:
+class Lamp(QWidget):
+    """One LED: a dot that takes the LED's colour as it gets brighter."""
+
+    SIZE = 14
+
+    def __init__(self, color: tuple[int, int, int]):
+        super().__init__()
+        self.color = color
+        self.amount = 0.0
+        self.setFixedSize(self.SIZE, self.SIZE)
+
+    def set(self, amount: float, color: Optional[tuple[int, int, int]] = None) -> None:
+        amount = max(0.0, min(1.0, amount))
+        color = color or self.color
+        if (amount, color) != (self.amount, self.color):
+            self.amount, self.color = amount, color
+            self.update()
+
+    def shown(self) -> QColor:
+        off = self.palette().color(QPalette.ColorRole.Mid)
+        mix = [round(o + (c - o) * self.amount)
+               for o, c in zip((off.red(), off.green(), off.blue()), self.color)]
+        return QColor(*mix)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(self.palette().color(QPalette.ColorRole.Dark))
+        painter.setBrush(self.shown())
+        painter.drawEllipse(1, 1, self.SIZE - 2, self.SIZE - 2)
+
+
+class WatchWindow(QMainWindow):
+    KEYS = {
+        Qt.Key.Key_Left: "down",
+        Qt.Key.Key_Right: "up",
+        Qt.Key.Key_Return: "select",
+        Qt.Key.Key_Enter: "select",
+        Qt.Key.Key_Space: "select",
+        Qt.Key.Key_Escape: "back",
+        Qt.Key.Key_Backspace: "back",
+    }
+    HINT = "Arrows and Enter: lever   Esc: side button   W A S D: tilt"
+
     def __init__(
         self,
         watch: Watch,
         scale: int = 3,
         sound: bool = True,
-        title: str = "Artemis Watch 2.0",
+        title: str = "Artemis Watch emulator",
         screenshot_dir: str = ".",
     ):
+        qInstallMessageHandler(_qt_message)
+        self._app = QApplication.instance() or QApplication(sys.argv[:1])
+        super().__init__()
         self.watch = watch
-        self.scale = scale
         self.screenshot_dir = screenshot_dir
-        self.title = title
+        self.setWindowTitle(title)
 
-        pygame.display.init()
-        pygame.font.init()
-
-        lcd_w = LCD_WIDTH * scale
-        lcd_h = LCD_HEIGHT * scale
-        self.case = pygame.Rect(MARGIN, MARGIN + STRAP_HEIGHT, PCB_WIDTH + lcd_w + 44, lcd_h + 44)
-        self.lcd_rect = pygame.Rect(self.case.right - lcd_w - 22, self.case.top + 22, lcd_w, lcd_h)
-        self.pcb = pygame.Rect(self.case.left + 12, self.case.top + 12, PCB_WIDTH, self.case.height - 24)
-
-        height = max(self.case.bottom + STRAP_HEIGHT + MARGIN, 620)
-        width = self.case.right + MARGIN + PANEL_WIDTH + MARGIN
-        self.screen = pygame.display.set_mode((width, height))
-        pygame.display.set_caption(title)
-        self.panel = pygame.Rect(self.case.right + MARGIN, MARGIN, PANEL_WIDTH, height - 2 * MARGIN)
-
-        self.font = pygame.font.Font(None, 22)
-        self.small = pygame.font.Font(None, 18)
-        self.heading = pygame.font.Font(None, 28)
-
-        self.lcd = pygame.Surface((LCD_WIDTH, LCD_HEIGHT), depth=16, masks=(0xF800, 0x07E0, 0x001F, 0))
-        self.seen_seq = -1
         self.buzzer = Buzzer(sound)
-        self.clock = pygame.time.Clock()
-
         self.pitch = 0.0
         self.roll = 0.0
-        self.tilt_dragging = False
-        self.battery_dragging = False
         self.last_motion_time = time.monotonic()
-        self.status = ""
-        self.status_until = 0.0
-        self.pressed: set[str] = set()
+        self._should_stop: Optional[Callable[[], bool]] = None
+        self._signal: Optional[int] = None
 
-        # Hit zones on the illustration.
-        cx = self.pcb.left + 62
-        cy = self.pcb.bottom - 62
-        self.lever_center = (cx, cy)
-        self.lever_left = pygame.Rect(cx - 52, cy - 34, 34, 68)
-        self.lever_push = pygame.Rect(cx - 18, cy - 34, 36, 68)
-        self.lever_right = pygame.Rect(cx + 18, cy - 34, 34, 68)
-        self.side_button = pygame.Rect(self.case.left - 6, self.case.top + 54, 12, 36)
-        self.usb_port = pygame.Rect(self.case.left - 6, self.case.top + 136, 46, 54)
-        self.mouse_button: Optional[str] = None
+        self.display = Display(watch, scale)
+        self.lamps = [Lamp(color) for color in LED_COLORS]
+        self.rgb_lamp = Lamp((255, 255, 255))
+        self.controls: dict[str, QAbstractButton] = {}
 
-        self._layout_panel()
+        left = QVBoxLayout()
+        left.addWidget(self.display)
+        left.addLayout(self._lamp_row())
+        left.addStretch()
+
+        right = QVBoxLayout()
+        right.addWidget(self._watch_group())
+        right.addWidget(self._buttons_group())
+        right.addWidget(self._motion_group())
+        right.addWidget(self._power_group())
+        right.addLayout(self._bottom_row())
+        right.addStretch()
+
+        columns = QHBoxLayout()
+        columns.addLayout(left)
+        columns.addLayout(right)
+        # In the layout, so that the window is as wide as any font makes it.
+        self.hint = QLabel(self.HINT)
+        layout = QVBoxLayout()
+        layout.addLayout(columns)
+        layout.addWidget(self.hint)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+        central = QWidget()
+        central.setLayout(layout)
+        self.setCentralWidget(central)
+
+        # Keys go to the watch, not to whichever control was clicked last.
+        for child in self.findChildren(QWidget):
+            if isinstance(child, (QAbstractButton, QSlider)):
+                child.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
         self.watch.bridge.set_imu((0.0, 0.0, 1000.0))
+        self.refresh()
 
     # ------------------------------------------------------------------
+    # Layout
 
-    def _layout_panel(self) -> None:
-        p = self.panel
-        x = p.left + 14
-        w = p.width - 28
-        y = p.top + 112
+    def _button(self, label: str, tip: str = "") -> QPushButton:
+        button = QPushButton(label)
+        if tip:
+            button.setToolTip(tip)
+        self.controls[label] = button
+        return button
 
-        self.tilt_pad = pygame.Rect(x + (w - 150) // 2, y + 22, 150, 150)
-        y = self.tilt_pad.bottom + 12
+    def _checkbox(self, label: str, tip: str = "") -> QCheckBox:
+        box = QCheckBox(label)
+        if tip:
+            box.setToolTip(tip)
+        self.controls[label] = box
+        return box
 
-        third = (w - 12) // 3
-        half = (w - 6) // 2
-        self.buttons = [
-            _Button("Tap", pygame.Rect(x, y, third, 28), lambda: self.watch.tap()),
-            _Button("Double tap", pygame.Rect(x + third + 6, y, third, 28),
-                    lambda: self.watch.tap(double=True)),
-            _Button("+10 steps", pygame.Rect(x + 2 * (third + 6), y, third, 28),
-                    lambda: self.watch.steps(10)),
-        ]
-        y += 62
-        self.battery_slider = pygame.Rect(x, y, w, 10)
-        y += 22
-        self.buttons += [
-            _Button("USB cable", pygame.Rect(x, y, half, 28), self._toggle_usb,
-                    lambda: self.watch.usb),
-            _Button("Charging", pygame.Rect(x + half + 6, y, half, 28), self._toggle_charging,
-                    lambda: self.watch.charging),
-        ]
-        y += 40
-        self.buttons += [
-            _Button("Reset", pygame.Rect(x, y, third, 28), self.watch.reset),
-            _Button("Screenshot", pygame.Rect(x + third + 6, y, third, 28), self.save_screenshot),
-            _Button("Mute", pygame.Rect(x + 2 * (third + 6), y, third, 28), self._toggle_mute,
-                    lambda: self.buzzer.muted),
-        ]
-        self.help_top = y + 40
+    def _lamp_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.addWidget(QLabel("LEDs"))
+        for number, lamp in enumerate(self.lamps, 1):
+            row.addSpacing(6)
+            row.addWidget(lamp)
+            row.addWidget(QLabel(str(number)))
+        row.addStretch()
+        row.addWidget(self.rgb_lamp)
+        row.addWidget(QLabel("RGB"))
+        return row
 
-    def _toggle_usb(self) -> None:
-        usb = not self.watch.usb
-        self.watch.set_battery(usb=usb, charging=usb and self.watch.charging)
+    def _watch_group(self) -> QGroupBox:
+        self.power_label = QLabel()
+        self.backlight_label = QLabel()
+        self.buzzer_label = QLabel()
+        form = QFormLayout()
+        form.addRow("Power", self.power_label)
+        form.addRow("Backlight", self.backlight_label)
+        form.addRow("Buzzer", self.buzzer_label)
+        group = QGroupBox(f"Watch, hardware revision {self.watch.state.revision}")
+        group.setLayout(form)
+        return group
 
-    def _toggle_charging(self) -> None:
-        charging = not self.watch.charging
+    def _buttons_group(self) -> QGroupBox:
+        grid = QGridLayout()
+        held = (("Left", "down", "Left arrow", 0, 0), ("Push", "select", "Enter or Space", 0, 1),
+                ("Right", "up", "Right arrow", 0, 2))
+        for label, name, tip, row, column in held:
+            button = self._button(label, tip)
+            button.pressed.connect(lambda name=name: self.watch.set_button(name, True))
+            button.released.connect(lambda name=name: self.watch.set_button(name, False))
+            grid.addWidget(button, row, column)
+        side = self._button("Side button", "Esc or Backspace")
+        side.pressed.connect(lambda: self.watch.set_button("back", True))
+        side.released.connect(lambda: self.watch.set_button("back", False))
+        grid.addWidget(side, 1, 0, 1, 3)
+        group = QGroupBox("Lever and button")
+        group.setLayout(grid)
+        return group
+
+    def _tilt_slider(self) -> QSlider:
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(-90, 90)
+        slider.setPageStep(TILT_STEP)
+        slider.valueChanged.connect(self._tilt_from_sliders)
+        return slider
+
+    def _motion_group(self) -> QGroupBox:
+        self.pitch_slider = self._tilt_slider()
+        self.roll_slider = self._tilt_slider()
+        self.pitch_label = QLabel()
+        self.roll_label = QLabel()
+        for label in (self.pitch_label, self.roll_label):
+            label.setMinimumWidth(label.fontMetrics().horizontalAdvance("-90°"))
+            label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Pitch"), 0, 0)
+        grid.addWidget(self.pitch_slider, 0, 1)
+        grid.addWidget(self.pitch_label, 0, 2)
+        grid.addWidget(QLabel("Roll"), 1, 0)
+        grid.addWidget(self.roll_slider, 1, 1)
+        grid.addWidget(self.roll_label, 1, 2)
+        grid.setColumnStretch(1, 1)
+
+        level = self._button("Level", "0")
+        level.clicked.connect(lambda: self._set_tilt(0, 0))
+        tap = self._button("Tap", "T")
+        tap.clicked.connect(lambda: self.watch.tap())
+        double = self._button("Double tap")
+        double.clicked.connect(lambda: self.watch.tap(double=True))
+        steps = self._button("+10 steps")
+        steps.clicked.connect(lambda: self.watch.steps(10))
+        row = QHBoxLayout()
+        for button in (level, tap, double, steps):
+            row.addWidget(button)
+
+        box = QVBoxLayout()
+        box.addLayout(grid)
+        box.addLayout(row)
+        group = QGroupBox("Motion")
+        group.setLayout(box)
+        return group
+
+    def _power_group(self) -> QGroupBox:
+        self.battery_slider = QSlider(Qt.Orientation.Horizontal)
+        self.battery_slider.setRange(*BATTERY_MV)
+        self.battery_slider.setPageStep(100)
+        self.battery_slider.setValue(self.watch.battery_mv)
+        self.battery_slider.valueChanged.connect(lambda mv: self.watch.set_battery(mv=mv))
+        self.battery_label = QLabel()
+
+        usb = self._checkbox("USB cable")
+        usb.clicked.connect(self._set_usb)
+        charging = self._checkbox("Charging")
+        charging.clicked.connect(self._set_charging)
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Battery"), 0, 0)
+        grid.addWidget(self.battery_slider, 0, 1)
+        grid.addWidget(self.battery_label, 0, 2)
+        grid.setColumnStretch(1, 1)
+        boxes = QHBoxLayout()
+        boxes.addWidget(usb)
+        boxes.addWidget(charging)
+        boxes.addStretch()
+        grid.addLayout(boxes, 1, 0, 1, 3)
+        group = QGroupBox("Power")
+        group.setLayout(grid)
+        return group
+
+    def _bottom_row(self) -> QHBoxLayout:
+        reset = self._button("Reset", "R. Cuts the power and restores it.")
+        reset.clicked.connect(self.watch.reset)
+        shot = self._button("Screenshot", "F12")
+        shot.clicked.connect(self.save_screenshot)
+        mute = self._checkbox("Mute", "M")
+        mute.clicked.connect(self._set_mute)
+        row = QHBoxLayout()
+        row.addWidget(reset)
+        row.addWidget(shot)
+        row.addStretch()
+        row.addWidget(mute)
+        return row
+
+    # ------------------------------------------------------------------
+    # What the controls do
+
+    def _set_usb(self, plugged: bool) -> None:
+        self.watch.set_battery(usb=plugged, charging=plugged and self.watch.charging)
+        self._show_switches()
+
+    def _set_charging(self, charging: bool) -> None:
         self.watch.set_battery(usb=self.watch.usb or charging, charging=charging)
+        self._show_switches()
 
-    def _toggle_mute(self) -> None:
-        self.buzzer.muted = not self.buzzer.muted
+    def _set_mute(self, muted: bool) -> None:
+        self.buzzer.muted = muted
+        self._show_switches()
+
+    def _show_switches(self) -> None:
+        self.controls["USB cable"].setChecked(self.watch.usb)
+        self.controls["Charging"].setChecked(self.watch.charging)
+        self.controls["Mute"].setChecked(self.buzzer.muted)
 
     def save_screenshot(self) -> None:
         name = time.strftime("artemis-%Y%m%d-%H%M%S.png")
-        path = os.path.join(self.screenshot_dir, name)
         state = self.watch.state
         if state.frame:
-            save_png(path, state.frame, LCD_WIDTH, LCD_HEIGHT, 3)
-            self._flash_status(f"Saved {name}")
-
-    def _flash_status(self, text: str) -> None:
-        self.status = text
-        self.status_until = time.monotonic() + 3
-
-    # ------------------------------------------------------------------
-    # Input
-
-    KEYS = {
-        pygame.K_LEFT: "down",
-        pygame.K_RIGHT: "up",
-        pygame.K_RETURN: "select",
-        pygame.K_SPACE: "select",
-        pygame.K_ESCAPE: "back",
-        pygame.K_BACKSPACE: "back",
-    }
+            save_png(os.path.join(self.screenshot_dir, name), state.frame, LCD_WIDTH, LCD_HEIGHT, 3)
+            self.hint.setText(f"Saved {name}")
+            QTimer.singleShot(3000, lambda: self.hint.setText(self.HINT))
 
     def _set_tilt(self, pitch: float, roll: float) -> None:
         now = time.monotonic()
         dt = max(now - self.last_motion_time, 0.005)
+        pitch = max(-90.0, min(90.0, pitch))
+        roll = max(-90.0, min(90.0, roll))
         gyro = ((pitch - self.pitch) / dt, (roll - self.roll) / dt, 0.0)
-        self.pitch = max(-90.0, min(90.0, pitch))
-        self.roll = max(-90.0, min(90.0, roll))
+        self.pitch, self.roll = pitch, roll
         self.last_motion_time = now
-        p, r = math.radians(self.pitch), math.radians(self.roll)
+        p, r = math.radians(pitch), math.radians(roll)
         accel = (math.sin(r) * math.cos(p), math.sin(p), math.cos(r) * math.cos(p))
         self.watch.set_motion(accel, gyro)
 
-    def _tilt_from_mouse(self, pos: tuple[int, int]) -> None:
-        pad = self.tilt_pad
-        self._set_tilt(
-            -((pos[1] - pad.centery) / (pad.height / 2)) * 90,
-            ((pos[0] - pad.centerx) / (pad.width / 2)) * 90,
-        )
+        for slider, value in ((self.pitch_slider, pitch), (self.roll_slider, roll)):
+            slider.blockSignals(True)
+            slider.setValue(round(value))
+            slider.blockSignals(False)
+        self.pitch_label.setText(f"{pitch:+.0f}°")
+        self.roll_label.setText(f"{roll:+.0f}°")
 
-    def _battery_from_mouse(self, x: int) -> None:
-        s = self.battery_slider
-        fraction = max(0.0, min(1.0, (x - s.left) / s.width))
-        self.watch.set_battery(mv=int(3200 + fraction * 1000))
+    def _tilt_from_sliders(self) -> None:
+        self._set_tilt(self.pitch_slider.value(), self.roll_slider.value())
 
-    def _lever_at(self, pos: tuple[int, int]) -> Optional[str]:
-        if self.lever_left.collidepoint(pos):
-            return "down"
-        if self.lever_right.collidepoint(pos):
-            return "up"
-        if self.lever_push.collidepoint(pos):
-            return "select"
-        if self.side_button.collidepoint(pos):
-            return "back"
-        return None
+    def keyPressEvent(self, event) -> None:
+        key = event.key()
+        if key in self.KEYS:
+            if not event.isAutoRepeat():
+                self.watch.set_button(self.KEYS[key], True)
+        elif key == Qt.Key.Key_F12:
+            self.save_screenshot()
+        elif key == Qt.Key.Key_M:
+            self._set_mute(not self.buzzer.muted)
+        elif key == Qt.Key.Key_R:
+            self.watch.reset()
+        elif key == Qt.Key.Key_T:
+            self.watch.tap()
+        elif key == Qt.Key.Key_0:
+            self._set_tilt(0, 0)
+        elif key in (Qt.Key.Key_W, Qt.Key.Key_S):
+            self._set_tilt(self.pitch + (TILT_STEP if key == Qt.Key.Key_W else -TILT_STEP), self.roll)
+        elif key in (Qt.Key.Key_A, Qt.Key.Key_D):
+            self._set_tilt(self.pitch, self.roll + (TILT_STEP if key == Qt.Key.Key_D else -TILT_STEP))
+        else:
+            super().keyPressEvent(event)
 
-    def _press(self, name: str) -> None:
-        self.pressed.add(name)
-        self.watch.set_button(name, True)
-
-    def _release(self, name: str) -> None:
-        self.pressed.discard(name)
-        self.watch.set_button(name, False)
-
-    def handle_event(self, event: pygame.event.Event) -> bool:
-        if event.type == pygame.QUIT:
-            return False
-
-        if event.type == pygame.KEYDOWN:
-            if event.key in self.KEYS:
-                self._press(self.KEYS[event.key])
-            elif event.key == pygame.K_F12:
-                self.save_screenshot()
-            elif event.key == pygame.K_m:
-                self._toggle_mute()
-            elif event.key == pygame.K_r:
-                self.watch.reset()
-            elif event.key == pygame.K_t:
-                self.watch.tap()
-            elif event.key == pygame.K_0:
-                self._set_tilt(0, 0)
-            elif event.key in (pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d):
-                self._set_tilt(
-                    self.pitch + {pygame.K_w: 10, pygame.K_s: -10}.get(event.key, 0),
-                    self.roll + {pygame.K_a: -10, pygame.K_d: 10}.get(event.key, 0),
-                )
-        elif event.type == pygame.KEYUP and event.key in self.KEYS:
-            self._release(self.KEYS[event.key])
-
-        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            name = self._lever_at(event.pos)
-            if name:
-                self.mouse_button = name
-                self._press(name)
-            elif self.usb_port.collidepoint(event.pos):
-                self._toggle_usb()
-            elif self.tilt_pad.collidepoint(event.pos):
-                self.tilt_dragging = True
-                self._tilt_from_mouse(event.pos)
-            elif self.battery_slider.inflate(0, 16).collidepoint(event.pos):
-                self.battery_dragging = True
-                self._battery_from_mouse(event.pos[0])
-            else:
-                for button in self.buttons:
-                    if button.rect.collidepoint(event.pos):
-                        button.action()
-        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
-            if self.tilt_pad.collidepoint(event.pos):
-                self._set_tilt(0, 0)
-        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-            if self.mouse_button:
-                self._release(self.mouse_button)
-                self.mouse_button = None
-            self.tilt_dragging = False
-            self.battery_dragging = False
-        elif event.type == pygame.MOUSEMOTION:
-            if self.tilt_dragging:
-                self._tilt_from_mouse(event.pos)
-            elif self.battery_dragging:
-                self._battery_from_mouse(event.pos[0])
-        return True
+    def keyReleaseEvent(self, event) -> None:
+        if event.key() in self.KEYS:
+            if not event.isAutoRepeat():
+                self.watch.set_button(self.KEYS[event.key()], False)
+        else:
+            super().keyReleaseEvent(event)
 
     # ------------------------------------------------------------------
-    # Drawing
+    # Showing the watch
 
-    def _text(self, text: str, pos: tuple[int, int], font=None, color=TEXT, center=False) -> None:
-        surface = (font or self.font).render(text, True, color)
-        rect = surface.get_rect(center=pos) if center else surface.get_rect(topleft=pos)
-        self.screen.blit(surface, rect)
+    def refresh(self) -> None:
+        watch = self.watch
+        self.display.refresh()
+        for lamp, amount in zip(self.lamps, watch.leds):
+            lamp.set(amount)
+        red, green, blue = watch.rgb_led
+        peak = max(red, green, blue)
+        if peak > 0:
+            self.rgb_lamp.set(peak, tuple(round(c / peak * 255) for c in (red, green, blue)))
+        else:
+            self.rgb_lamp.set(0)
 
-    def _led(self, center: tuple[int, int], color: tuple[int, int, int], amount: float, r: int = 6) -> None:
-        amount = max(0.0, min(1.0, amount))
-        if amount > 0.02:
-            glow = pygame.Surface((r * 8, r * 8), pygame.SRCALPHA)
-            for i in range(4, 0, -1):
-                pygame.draw.circle(glow, (*color, int(46 * amount * (5 - i) / 4)), (r * 4, r * 4), r + i * r // 2)
-            self.screen.blit(glow, (center[0] - r * 4, center[1] - r * 4))
-        pygame.draw.circle(self.screen, _lit(color, amount), center, r)
-        pygame.draw.circle(self.screen, (20, 20, 22), center, r, 1)
+        self.power_label.setText("on" if watch.state.powered else "off")
+        self.backlight_label.setText(f"{watch.backlight * 100:.0f}%")
+        freq, duty = watch.buzzer
+        self.buzzer_label.setText(f"{freq} Hz" if freq and duty > 0 else "quiet")
+        self.buzzer.set(freq, duty)
+        self.buzzer.pump()
 
-    def _draw_strap(self) -> None:
-        strap = pygame.Rect(self.lcd_rect.left + 40, 0, self.lcd_rect.width - 80, self.screen.get_height())
-        pygame.draw.rect(self.screen, STRAP, strap)
-        for i in range(3):
-            x = strap.left + 28 + i * 34
-            y = self.case.top - 40
-            pygame.draw.polygon(
-                self.screen, ACCENT,
-                [(x, y + 20), (x + 14, y + 20), (x + 28, y), (x + 14, y)],
-            )
+        self.battery_label.setText(f"{watch.battery_mv / 1000:.2f} V")
+        if not self.battery_slider.isSliderDown():
+            self.battery_slider.blockSignals(True)
+            self.battery_slider.setValue(watch.battery_mv)
+            self.battery_slider.blockSignals(False)
+        self._show_switches()
+        self.pitch_label.setText(f"{self.pitch:+.0f}°")
+        self.roll_label.setText(f"{self.roll:+.0f}°")
 
-    def _draw_pcb(self) -> None:
-        screen = self.screen
-        p = self.pcb
-        pygame.draw.rect(screen, PCB, p, border_radius=6)
-
-        # The ESP32-S3 module.
-        module = pygame.Rect(p.left + 54, p.top + 16, 108, 96)
-        pygame.draw.rect(screen, METAL, module, border_radius=3)
-        self._text("ESP32-S3", (module.centerx, module.top + 30), self.small, (40, 40, 44), center=True)
-        self._text("MINI-1 N4R2", (module.centerx, module.top + 50), self.small, (70, 70, 76), center=True)
-
-        # USB-C: click to plug and unplug.
-        usb = self.usb_port
-        pygame.draw.rect(screen, METAL, usb, border_radius=8)
-        pygame.draw.rect(screen, (40, 42, 46), usb.inflate(-14, -30), border_radius=4)
-        if self.watch.usb:
-            cable = pygame.Rect(usb.left - 6, usb.centery - 10, 26, 20)
-            pygame.draw.rect(screen, ACCENT, cable, border_radius=3)
-        self._text("USB", (usb.centerx + 4, usb.bottom + 12), self.small, TEXT_DIM, center=True)
-
-        # Piezo buzzer.
-        freq, duty = self.watch.buzzer
-        center = (p.right - 46, p.top + 176)
-        pygame.draw.circle(screen, (8, 8, 9), center, 30)
-        pygame.draw.circle(screen, (60, 62, 66), center, 30, 2)
-        pygame.draw.circle(screen, (30, 30, 32), center, 6)
-        if freq:
-            for r in (36, 42):
-                pygame.draw.circle(screen, ACCENT, center, r, 1)
-            self._text(f"{freq} Hz", (center[0], center[1] - 50), self.small, ACCENT, center=True)
-
-        # Lever switch: left, right, and push down in the middle.
-        cx, cy = self.lever_center
-        offset = 0
-        if "down" in self.pressed:
-            offset = -14
-        elif "up" in self.pressed:
-            offset = 14
-        pygame.draw.rect(screen, METAL, (cx - 34, cy - 18, 68, 36), border_radius=8)
-        radius = 13 if "select" in self.pressed else 16
-        knob = (cx + offset, cy)
-        pygame.draw.circle(screen, (70, 72, 78), knob, radius + 2)
-        pygame.draw.circle(screen, (118, 122, 130), knob, radius)
-        self._text("<", (cx - 45, cy), self.font, TEXT_DIM, center=True)
-        self._text(">", (cx + 45, cy), self.font, TEXT_DIM, center=True)
-        self._text("lever", (cx, cy + 38), self.small, TEXT_DIM, center=True)
-
-        # Side button.
-        pressed = "back" in self.pressed
-        button = self.side_button.move(4 if pressed else 0, 0)
-        pygame.draw.rect(screen, (200, 40, 36), button, border_radius=3)
-        self._text("button", (button.right + 26, button.centery), self.small, TEXT_DIM, center=True)
-
-    def _draw_lcd(self) -> None:
-        state = self.watch.state
-        if state.frame and state.frame_seq != self.seen_seq:
-            self.seen_seq = state.frame_seq
-            self.lcd.get_buffer().write(state.frame, 0)
-
-        r = self.lcd_rect
-        pygame.draw.rect(self.screen, (8, 8, 8), r.inflate(14, 14), border_radius=4)
-        if not state.powered:
-            pygame.draw.rect(self.screen, (0, 0, 0), r)
-            self._text("powered off", r.center, self.font, (70, 70, 74), center=True)
-            self._text("press the button to turn on", (r.centerx, r.centery + 22), self.small,
-                       (70, 70, 74), center=True)
+    def _tick(self) -> None:
+        stop = self._should_stop
+        if self._signal is not None or not self.watch.running or (stop and stop()):
+            self.close()
             return
+        self.refresh()
 
-        scaled = pygame.transform.scale(self.lcd, r.size)
-        self.screen.blit(scaled, r)
-        brightness = self.watch.backlight
-        if brightness < 0.995:
-            shade = pygame.Surface(r.size)
-            # The panel's image stays faintly visible with the backlight off.
-            shade.set_alpha(int(255 * (1 - max(brightness, 0.02)) ** 1.5))
-            self.screen.blit(shade, r)
-
-    def _draw_leds(self) -> None:
-        r = self.lcd_rect
-        leds = self.watch.leds
-        # Bottom edge LED1, LED2; right edge LED3, LED4; top edge LED5, LED6.
-        self._led((r.left + r.width // 3, r.bottom + 12), LED_ICE_BLUE, leds[0])
-        self._led((r.right - r.width // 3, r.bottom + 12), LED_ICE_BLUE, leds[1])
-        self._led((r.right + 12, r.bottom - r.height // 3), LED_ORANGE, leds[2])
-        self._led((r.right + 12, r.top + r.height // 3), LED_ORANGE, leds[3])
-        self._led((r.right - r.width // 3, r.top - 12), LED_ICE_BLUE, leds[4])
-        self._led((r.left + r.width // 3, r.top - 12), LED_ICE_BLUE, leds[5])
-
-        # The RGB status LED sits to the left of the screen.
-        red, green, blue = self.watch.rgb_led
-        amount = max(red, green, blue)
-        color = (int(red * 255), int(green * 255), int(blue * 255)) if amount else (255, 255, 255)
-        peak = max(color) or 255
-        color = tuple(c * 255 // peak for c in color)
-        self._led((r.left - 12, r.centery), color, amount, 6)
-
-    def _draw_panel(self) -> None:
-        p = self.panel
-        pygame.draw.rect(self.screen, PANEL, p, border_radius=8)
-        pygame.draw.rect(self.screen, PANEL_EDGE, p, 1, border_radius=8)
-        x = p.left + 14
-
-        self._text("Artemis Watch 2.0", (x, p.top + 12), self.heading, ACCENT)
-        state = self.watch.state
-        self._text(f"hardware revision {state.revision}", (x, p.top + 38), self.small, TEXT_DIM)
-        power = "on" if state.powered else "off"
-        self._text(f"power {power}   backlight {self.watch.backlight * 100:.0f}%",
-                   (x, p.top + 58), self.small, TEXT)
-        self._text(f"{self.clock.get_fps():.0f} fps   display frame {state.frame_seq}",
-                   (x, p.top + 76), self.small, TEXT_DIM)
-
-        # Tilt pad.
-        pad = self.tilt_pad
-        self._text(f"tilt: pitch {self.pitch:+.0f}, roll {self.roll:+.0f}", (x, pad.top - 20), self.small, TEXT)
-        pygame.draw.rect(self.screen, BACKGROUND, pad, border_radius=6)
-        pygame.draw.rect(self.screen, PANEL_EDGE, pad, 1, border_radius=6)
-        pygame.draw.line(self.screen, PANEL_EDGE, pad.midleft, pad.midright)
-        pygame.draw.line(self.screen, PANEL_EDGE, pad.midtop, pad.midbottom)
-        dot = (pad.centerx + int(self.roll / 90 * pad.width / 2),
-               pad.centery - int(self.pitch / 90 * pad.height / 2))
-        pygame.draw.circle(self.screen, ACCENT, dot, 7)
-
-        # Battery.
-        s = self.battery_slider
-        self._text(f"battery: {self.watch.battery_mv / 1000:.2f} V", (x, s.top - 20), self.small, TEXT)
-        pygame.draw.rect(self.screen, BACKGROUND, s, border_radius=5)
-        fraction = (self.watch.battery_mv - 3200) / 1000
-        pygame.draw.rect(self.screen, ACCENT,
-                         (s.left, s.top, int(s.width * max(0.0, min(1.0, fraction))), s.height),
-                         border_radius=5)
-        knob_x = s.left + int(s.width * max(0.0, min(1.0, fraction)))
-        pygame.draw.circle(self.screen, TEXT, (knob_x, s.centery), 8)
-
-        mouse = pygame.mouse.get_pos()
-        for button in self.buttons:
-            active = button.active()
-            fill = ACCENT if active else (56, 60, 68) if button.rect.collidepoint(mouse) else (46, 50, 57)
-            pygame.draw.rect(self.screen, fill, button.rect, border_radius=5)
-            self._text(button.label, button.rect.center, self.small,
-                       (20, 20, 20) if active else TEXT, center=True)
-
-        y = self.help_top
-        for line in (
-            "Left / Right   lever",
-            "Enter or Space   push lever",
-            "Esc   side button",
-            "W A S D   tilt, 0   level",
-            "T tap, R reset, M mute, F12 screenshot",
-        ):
-            self._text(line, (x, y), self.small, TEXT_DIM)
-            y += 17
-
-        if time.monotonic() < self.status_until:
-            self._text(self.status, (x, p.bottom - 20), self.small, ACCENT)
-
-    def render(self) -> None:
-        self.screen.fill(BACKGROUND)
-        self._draw_strap()
-        pygame.draw.rect(self.screen, CASE, self.case, border_radius=18)
-        pygame.draw.rect(self.screen, CASE_EDGE, self.case, 2, border_radius=18)
-        self._draw_pcb()
-        self._draw_lcd()
-        self._draw_leds()
-        self._draw_panel()
+    def closeEvent(self, event) -> None:
+        self._timer.stop()
+        self.buzzer.close()
+        super().closeEvent(event)
+        self._app.quit()
 
     def run(self, should_stop: Optional[Callable[[], bool]] = None) -> None:
-        running = True
-        while running and self.watch.running:
-            for event in pygame.event.get():
-                running = self.handle_event(event) and running
-            if should_stop and should_stop():
-                break
-            freq, duty = self.watch.buzzer
-            self.buzzer.set(freq, duty)
-            self.render()
-            pygame.display.flip()
-            self.clock.tick(60)
-        pygame.quit()
+        """Shows the window until it is closed, the watch goes away, or `should_stop` says so."""
+        self._should_stop = should_stop
+
+        # A signal's handler can't unwind Qt's event loop, so it only leaves a note,
+        # and the signal is delivered again once the loop has ended.
+        caught = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+        saved = {}
+        if threading.current_thread() is threading.main_thread():
+            for number in caught:
+                saved[number] = signal.signal(number, lambda n, frame: setattr(self, "_signal", n))
+        try:
+            self.show()
+            self._timer.start(16)
+            self._app.exec()
+        finally:
+            self._timer.stop()
+            for number, handler in saved.items():
+                signal.signal(number, handler)
+        if self._signal is not None:
+            number, self._signal = self._signal, None
+            signal.raise_signal(number)

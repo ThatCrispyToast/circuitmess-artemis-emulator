@@ -37,10 +37,21 @@
       micropythonFirmware = pkgs.callPackage ./nix/micropython.nix { };
 
       python = pkgs.python3.withPackages (ps: [
-        ps.pygame-ce
+        ps.pyside6
         ps.pytest
         ps.pyserial
       ]);
+
+      # The system's fonts where it has any, and one for where it has none.
+      fontsConf = pkgs.writeText "artemis-emu-fonts.conf" ''
+        <?xml version="1.0"?>
+        <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+        <fontconfig>
+          <include ignore_missing="yes">/etc/fonts/fonts.conf</include>
+          <dir>${pkgs.dejavu_fonts.minimal}/share/fonts</dir>
+          <cachedir prefix="xdg">fontconfig</cachedir>
+        </fontconfig>
+      '';
 
       emulator = pkgs.stdenv.mkDerivation {
         pname = "artemis-emu";
@@ -63,6 +74,7 @@
             --set ARTEMIS_STOCK_FIRMWARE_DIR ${stockFirmwareDir}
             --set ARTEMIS_MICROPYTHON_FIRMWARE ${micropythonFirmware}/firmware.bin
             --prefix PATH : ${pkgs.esptool}/bin
+            --set-default FONTCONFIG_FILE ${fontsConf}
           )
           makeWrapper ${python}/bin/python $out/bin/artemis-emu \
             --add-flags "-m artemis_emu" "''${env[@]}"

@@ -1,14 +1,15 @@
-"""The window's controls, with SDL's offscreen drivers standing in for a desktop."""
+"""The window's controls, with Qt's offscreen platform standing in for a desktop."""
 
 import os
+import time
 
-os.environ["SDL_VIDEODRIVER"] = "dummy"
-os.environ["SDL_AUDIODRIVER"] = "dummy"
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-import pygame
 import pytest
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtTest import QTest
 
-from artemis_emu.gui import WatchWindow
+from artemis_emu.gui import Buzzer, WatchWindow
 
 SETUP = "import Artemis\nfrom machine import ADC, Pin\nArtemis.begin()\n"
 
@@ -16,8 +17,10 @@ SETUP = "import Artemis\nfrom machine import ADC, Pin\nArtemis.begin()\n"
 @pytest.fixture
 def window(micropython):
     micropython.run(SETUP)
-    yield WatchWindow(micropython.watch, sound=False)
-    pygame.quit()
+    window = WatchWindow(micropython.watch, sound=False)
+    window.show()
+    yield window
+    window.close()
 
 
 def read(session, expression):
@@ -28,59 +31,51 @@ def pin(session, number):
     return read(session, f"Pin({number}).value()")
 
 
-def key(window, code, down=True):
-    window.handle_event(pygame.event.Event(pygame.KEYDOWN if down else pygame.KEYUP, key=code))
-
-
-def click(window, pos, button=1):
-    window.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=pos, button=button))
-
-
-def release(window, pos=(0, 0)):
-    window.handle_event(pygame.event.Event(pygame.MOUSEBUTTONUP, pos=pos, button=1))
-
-
-def control(window, label):
-    return next(b for b in window.buttons if b.label == label).rect.center
+def click(window, label):
+    QTest.mouseClick(window.controls[label], Qt.MouseButton.LeftButton)
 
 
 @pytest.mark.parametrize(
-    "code, gpio",
+    "key, gpio",
     [
-        (pygame.K_LEFT, 2),
-        (pygame.K_RIGHT, 1),
-        (pygame.K_RETURN, 3),
-        (pygame.K_SPACE, 3),
-        (pygame.K_ESCAPE, 21),
-        (pygame.K_BACKSPACE, 21),
+        (Qt.Key.Key_Left, 2),
+        (Qt.Key.Key_Right, 1),
+        (Qt.Key.Key_Return, 3),
+        (Qt.Key.Key_Space, 3),
+        (Qt.Key.Key_Escape, 21),
+        (Qt.Key.Key_Backspace, 21),
     ],
 )
-def test_keys_work_the_lever_and_button(micropython, window, code, gpio):
-    key(window, code)
+def test_keys_work_the_lever_and_button(micropython, window, key, gpio):
+    QTest.keyPress(window, key)
     assert pin(micropython, gpio) == 1
-    key(window, code, down=False)
+    QTest.keyRelease(window, key)
     assert pin(micropython, gpio) == 0
 
 
-@pytest.mark.parametrize(
-    "zone, gpio",
-    [("lever_left", 2), ("lever_right", 1), ("lever_push", 3), ("side_button", 21)],
-)
-def test_mouse_works_the_lever_and_button(micropython, window, zone, gpio):
-    click(window, getattr(window, zone).center)
+@pytest.mark.parametrize("label, gpio", [("Left", 2), ("Right", 1), ("Push", 3), ("Side button", 21)])
+def test_buttons_work_the_lever_and_button(micropython, window, label, gpio):
+    QTest.mousePress(window.controls[label], Qt.MouseButton.LeftButton)
     assert pin(micropython, gpio) == 1
-    release(window)
+    QTest.mouseRelease(window.controls[label], Qt.MouseButton.LeftButton)
     assert pin(micropython, gpio) == 0
+
+
+def test_keys_reach_the_watch_after_a_control_was_clicked(micropython, window):
+    click(window, "Tap")
+    QTest.keyPress(window, Qt.Key.Key_Space)
+    assert pin(micropython, 3) == 1
+    QTest.keyRelease(window, Qt.Key.Key_Space)
 
 
 def test_tilt_keys_reach_the_accelerometer(micropython, window):
-    key(window, pygame.K_w)
-    key(window, pygame.K_w)
-    key(window, pygame.K_w)
+    for _ in range(3):
+        QTest.keyClick(window, Qt.Key.Key_W)
     _, y, _ = read(micropython, "Artemis.imu.get_accel()")
     assert y == pytest.approx(0.5, abs=0.02)
+    assert window.pitch_slider.value() == 30
 
-    key(window, pygame.K_0)
+    QTest.keyClick(window, Qt.Key.Key_0)
     x, y, z = read(micropython, "Artemis.imu.get_accel()")
     assert (x, y, z) == (
         pytest.approx(0, abs=0.02),
@@ -89,22 +84,19 @@ def test_tilt_keys_reach_the_accelerometer(micropython, window):
     )
 
 
-def test_tilt_pad_reaches_the_accelerometer(micropython, window):
-    pad = window.tilt_pad
-    click(window, (pad.centerx + pad.width // 6, pad.centery))
-    release(window)
+def test_tilt_sliders_reach_the_accelerometer(micropython, window):
+    window.roll_slider.setValue(30)
     x, _, _ = read(micropython, "Artemis.imu.get_accel()")
     assert x == pytest.approx(0.5, abs=0.03)
 
-    click(window, pad.center, button=3)
+    click(window, "Level")
     x, _, _ = read(micropython, "Artemis.imu.get_accel()")
     assert x == pytest.approx(0, abs=0.02)
+    assert window.roll_slider.value() == 0
 
 
 def test_battery_slider_reaches_the_adc(micropython, window):
-    slider = window.battery_slider
-    click(window, (slider.left, slider.centery))
-    release(window)
+    window.battery_slider.setValue(3200)
     micropython.run("adc = ADC(Pin(5), atten=ADC.ATTN_11DB)")
     assert read(micropython, "adc.read_uv()") == pytest.approx((3200 - 75) / 4 * 1000, rel=0.03)
 
@@ -114,63 +106,111 @@ def test_usb_and_charging_controls(micropython, window):
     assert read(micropython, "usb.value()") == 0
     assert read(micropython, "charge.value()") == 1
 
-    click(window, control(window, "USB cable"))
+    click(window, "USB cable")
     assert read(micropython, "usb.value()") == 1
 
-    click(window, control(window, "Charging"))
+    click(window, "Charging")
     assert read(micropython, "charge.value()") == 0
 
-    click(window, window.usb_port.center)
+    # Pulling the cable stops the charging too.
+    click(window, "USB cable")
     assert read(micropython, "usb.value()") == 0
     assert read(micropython, "charge.value()") == 1
+    window.refresh()
+    assert not window.controls["Charging"].isChecked()
 
 
 def test_tap_and_step_controls_do_not_disturb_the_program(micropython, window):
-    click(window, control(window, "Tap"))
-    click(window, control(window, "Double tap"))
-    click(window, control(window, "+10 steps"))
-    key(window, pygame.K_t)
+    click(window, "Tap")
+    click(window, "Double tap")
+    click(window, "+10 steps")
+    QTest.keyClick(window, Qt.Key.Key_T)
     assert read(micropython, "1 + 1") == 2
 
 
 def test_reset_key_and_button_restart_the_watch(micropython, window):
     watch = micropython.watch
-    for act in (lambda: key(window, pygame.K_r), lambda: click(window, control(window, "Reset"))):
+    for act in (lambda: QTest.keyClick(window, Qt.Key.Key_R), lambda: click(window, "Reset")):
         boots = watch.usb_output.count("ESP-ROM:esp32s3")
         act()
         watch.wait_until(lambda: watch.usb_output.count("ESP-ROM:esp32s3") > boots, timeout=5)
 
 
-def test_mute_key_and_button(window):
+def test_mute_key_and_checkbox(window):
     assert window.buzzer.muted
-    key(window, pygame.K_m)
+    QTest.keyClick(window, Qt.Key.Key_M)
     assert not window.buzzer.muted
-    click(window, control(window, "Mute"))
+    click(window, "Mute")
     assert window.buzzer.muted
 
 
-def test_screenshot_key_saves_the_display(micropython, window, tmp_path):
+def pump_for(buzzer, seconds):
+    """Refreshes the buzzer as the window does, and returns the longest that took."""
+    longest, end = 0.0, time.monotonic() + seconds
+    while time.monotonic() < end:
+        before = time.monotonic()
+        buzzer.pump()
+        longest = max(longest, time.monotonic() - before)
+        time.sleep(0.01)
+    return longest
+
+
+def test_sound_server_that_never_answers_holds_nothing_up(capfd):
+    buzzer = Buzzer()
+    buzzer.PROBE = "import time\ntime.sleep(60)\n"
+    buzzer.PROBE_SECONDS = 0.5
+    assert pump_for(buzzer, 1.5) < 0.25
+    assert not buzzer.available
+    assert buzzer._probe is None
+    assert "No sound" in capfd.readouterr().err
+
+
+def test_no_sound_card_is_not_worth_a_word(capfd):
+    buzzer = Buzzer()
+    buzzer.PROBE = "import sys\nsys.exit(1)\n"
+    assert pump_for(buzzer, 1.0) < 0.25
+    assert not buzzer.available
+    assert capfd.readouterr().err == ""
+
+
+def test_muted_buzzer_leaves_the_sound_card_alone():
+    buzzer = Buzzer(enabled=False)
+    pump_for(buzzer, 0.1)
+    assert buzzer._probe is None and not buzzer.available
+
+
+def test_screenshot_key_and_button_save_the_display(micropython, window, tmp_path):
     window.screenshot_dir = str(tmp_path)
     micropython.watch.frame()
-    key(window, pygame.K_F12)
+    QTest.keyClick(window, Qt.Key.Key_F12)
     shots = list(tmp_path.glob("artemis-*.png"))
     assert len(shots) == 1
     assert shots[0].read_bytes()[:4] == b"\x89PNG"
 
 
-def show(window):
+def shown(window):
+    """The colour in the middle of the display, as the window draws it."""
     window.watch.frame()
-    window.render()
-    return window.screen.get_at(window.lcd_rect.center)[:3]
+    window.refresh()
+    color = window.display.grab().toImage().pixelColor(window.display.lcd.center())
+    return color.red(), color.green(), color.blue()
 
 
 def test_window_shows_the_display_dimmed_by_the_backlight(micropython, window):
     micropython.run("d = Artemis.display\nd.fill(d.Color.Red)\nd.commit()")
-    red, green, blue = show(window)
+    red, green, blue = shown(window)
     assert red > 200 and green < 40 and blue < 40
 
     micropython.run("Artemis.backlight.off()")
-    assert show(window)[0] < 60
+    assert shown(window)[0] < 60
+
+
+def test_window_shows_the_leds(micropython, window):
+    micropython.run("Artemis.leds[2].on()")
+    window.refresh()
+    lit = window.lamps[2].shown()
+    assert (lit.red(), lit.green(), lit.blue()) == (255, 150, 30)
+    assert window.lamps[0].shown() != lit
 
 
 def test_window_runs_until_told_to_stop(window):
