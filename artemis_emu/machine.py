@@ -43,6 +43,10 @@ BUZZER_PIN = 47
 LCD_WIDTH = 128
 LCD_HEIGHT = 128
 
+# The USB Serial/JTAG controller's interrupt enables, and the one for a packet received.
+_USB_INT_ENA = 0x60038010
+_USB_INT_OUT_RECV_PKT = 1 << 2
+
 
 class EmulatorError(Exception):
     pass
@@ -129,6 +133,7 @@ class _QMP:
     def __init__(self, path: str):
         self._sock = _connect_unix(path)
         self._file = self._sock.makefile("r")
+        self._lock = threading.Lock()
         self._file.readline()  # greeting
         self.command("qmp_capabilities")
 
@@ -136,11 +141,12 @@ class _QMP:
         msg: dict = {"execute": name}
         if arguments:
             msg["arguments"] = arguments
-        self._sock.sendall(json.dumps(msg).encode() + b"\n")
-        while True:
-            reply = json.loads(self._file.readline())
-            if "return" in reply or "error" in reply:
-                return reply
+        with self._lock:
+            self._sock.sendall(json.dumps(msg).encode() + b"\n")
+            while True:
+                reply = json.loads(self._file.readline())
+                if "return" in reply or "error" in reply:
+                    return reply
 
     def close(self) -> None:
         self._file.close()
@@ -556,6 +562,19 @@ class Watch:
     @property
     def output(self) -> str:
         return self.usb_output + self.uart_output
+
+    @property
+    def usb_listening(self) -> bool:
+        """
+        Whether firmware takes interrupts for what arrives on the USB serial port.
+        Until it does, anything sent sits unread in the way of what follows.
+        """
+        try:
+            reply = self._qmp.command("human-monitor-command",
+                                      **{"command-line": f"xp /1xw {_USB_INT_ENA:#x}"})
+            return bool(int(reply["return"].split(":")[1], 16) & _USB_INT_OUT_RECV_PKT)
+        except (AttributeError, OSError, LookupError, ValueError):
+            return False  # the emulator isn't running
 
     def write_serial(self, text: Union[str, bytes]) -> None:
         data = text.encode() if isinstance(text, str) else text

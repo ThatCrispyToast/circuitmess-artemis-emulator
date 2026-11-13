@@ -13,6 +13,7 @@ _BOOT_BANNER = b"ESP-ROM:"
 # the outside when it prints nothing, as when main.py runs straight away.
 _UP_SIGNS = (b"MicroPython v", b">>> ", b"Performing initial setup")
 _BOOT_TIME = 1.0
+_NEVER_ANSWERED = "MicroPython's REPL never answered: is this a MicroPython firmware?"
 # Asks the raw REPL for raw-paste mode, where the watch paces what it's sent.
 _RAW_PASTE = b"\x05A\x01"
 
@@ -71,25 +72,36 @@ class PythonSession:
         except OSError:
             raise EmulatorError(f"the watch is gone: {self.watch.emulator_log()}") from None
 
-    def _wait_until_listening(self) -> None:
+    def _wait_until_listening(self, timeout: float) -> bool:
         """
         After a restart, holds off until MicroPython is up. On the watch, bytes that
         arrive before it starts reading its USB port are never read, and stop
-        everything sent after them from getting through.
+        everything sent after them from getting through. False if it never got there.
         """
+        if hasattr(type(self.watch), "usb_listening"):
+            # The emulator can say; a real watch has to be judged by what it prints.
+            deadline = time.monotonic() + timeout
+            while self.watch.running and not self.watch.usb_listening:
+                if time.monotonic() > deadline:
+                    return False
+                time.sleep(0.01)
+            return True
+
         deadline = time.monotonic() + _BOOT_TIME
         while time.monotonic() < deadline:
             buffer = self.port.buffer
             boot = buffer.rfind(_BOOT_BANNER)
             recently = time.monotonic() - self.watch.restarted_at < _BOOT_TIME
             if boot < 0 and not recently:
-                return  # it has been running all along
+                break  # it has been running all along
             if any(buffer.find(sign, max(boot, 0)) >= 0 for sign in _UP_SIGNS):
-                return
+                break
             time.sleep(0.01)
+        return True
 
     def _enter_raw(self, timeout: float) -> None:
-        self._wait_until_listening()
+        if not self._wait_until_listening(timeout):
+            raise TimeoutError(_NEVER_ANSWERED)
         deadline = time.monotonic() + timeout
         while True:
             self._mark = len(self.port.buffer)
@@ -102,9 +114,7 @@ class PythonSession:
                 return
             except TimeoutError:
                 if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        "MicroPython's REPL never answered: is this a MicroPython firmware?"
-                    ) from None
+                    raise TimeoutError(_NEVER_ANSWERED) from None
 
     def start(self, code: str) -> None:
         """Starts code without waiting for it, to interact with it or if it restarts the watch."""

@@ -3196,7 +3196,36 @@ diff -ruN a/system/cpus.c b/system/cpus.c
  #include "sysemu/whpx.h"
  #include "hw/boards.h"
  #include "hw/hw.h"
-@@ -450,6 +452,39 @@
+@@ -415,12 +417,27 @@
+ /* system init */
+ static QemuCond qemu_pause_cond;
+ 
++/* Taken for a microsecond at each device access: spin briefly before sleeping for it. */
++static void bql_init(void)
++{
++    qemu_mutex_init(&bql);
++#ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
++    pthread_mutexattr_t attr;
++
++    pthread_mutexattr_init(&attr);
++    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
++    pthread_mutex_destroy(&bql.lock);
++    pthread_mutex_init(&bql.lock, &attr);
++    pthread_mutexattr_destroy(&attr);
++#endif
++}
++
+ void qemu_init_cpu_loop(void)
+ {
+     qemu_init_sigbus();
+     qemu_cond_init(&qemu_cpu_cond);
+     qemu_cond_init(&qemu_pause_cond);
+-    qemu_mutex_init(&bql);
++    bql_init();
+ 
+     qemu_thread_get_self(&io_thread);
+ }
+@@ -450,6 +467,40 @@
      process_queued_cpu_work(cpu);
  }
  
@@ -3222,7 +3251,8 @@ diff -ruN a/system/cpus.c b/system/cpus.c
 +        left += until.tv_nsec - IDLE_WAKE_EARLY_NS;
 +        until.tv_sec += left / NANOSECONDS_PER_SECOND;
 +        until.tv_nsec = left % NANOSECONDS_PER_SECOND;
-+        pthread_cond_timedwait(&cpu->halt_cond->cond, &bql.lock, &until);
++        /* By the monotonic clock, whichever one the condition variable was made with. */
++        pthread_cond_clockwait(&cpu->halt_cond->cond, &bql.lock, CLOCK_MONOTONIC, &until);
 +    } else {
 +        bql_unlock();
 +        while (!qemu_clock_expired(QEMU_CLOCK_VIRTUAL) && cpu_thread_is_idle(cpu)) {
@@ -3236,7 +3266,7 @@ diff -ruN a/system/cpus.c b/system/cpus.c
  void qemu_wait_io_event(CPUState *cpu)
  {
      bool slept = false;
-@@ -459,7 +494,7 @@
+@@ -459,7 +510,7 @@
              slept = true;
              qemu_plugin_vcpu_idle_cb(cpu);
          }

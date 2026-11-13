@@ -44,6 +44,23 @@ def test_session_survives_an_exception(micropython):
     assert micropython.run("print('still here')").strip() == "still here"
 
 
+def test_session_waits_out_a_slow_boot():
+    """However long startup takes the computer, nothing is sent before MicroPython reads."""
+    with Watch(FIRMWARE) as watch:
+        watch.pause()
+        assert not watch.usb_listening
+        threading.Timer(2.0, watch.resume).start()
+        session = PythonSession(watch)
+        assert watch.usb_listening
+        assert session.run("print(6 * 7)").strip() == "42"
+
+
+def test_session_gives_up_on_firmware_that_never_reads_its_usb_port():
+    with Watch(os.environ["ARTEMIS_STOCK_FIRMWARE"]) as watch:
+        with pytest.raises(TimeoutError, match="never answered"):
+            PythonSession(watch, boot_timeout=3)
+
+
 def test_is_the_circuitmess_build_for_their_s3_devices(micropython):
     machine = evaluate(micropython, "__import__('os').uname().machine")
     assert machine == "CircuitMess ESP32S3 Devices with ESP32S3"
