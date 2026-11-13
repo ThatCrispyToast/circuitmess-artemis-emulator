@@ -65,17 +65,24 @@ struct ArtemisLedcState {
 
     MemoryRegion iomem;
     qemu_irq irq;
-    QEMUTimer *fade_timer;
+    QEMUTimer *timer;
 
     uint32_t ch_conf0[ARTEMIS_LEDC_CHANNELS];
     uint32_t ch_hpoint[ARTEMIS_LEDC_CHANNELS];
     uint32_t ch_duty[ARTEMIS_LEDC_CHANNELS];     /* shadow, 1/16 steps */
     uint32_t ch_conf1[ARTEMIS_LEDC_CHANNELS];
+    uint32_t ch_hpoint_out[ARTEMIS_LEDC_CHANNELS];
     uint32_t ch_duty_out[ARTEMIS_LEDC_CHANNELS]; /* latched, 1/16 steps */
     bool ch_fading[ARTEMIS_LEDC_CHANNELS];
     int64_t ch_fade_next[ARTEMIS_LEDC_CHANNELS];
+    /* Shadow registers waiting for their timer to overflow. */
+    bool ch_latch_pending[ARTEMIS_LEDC_CHANNELS];
+    int64_t ch_latch_at[ARTEMIS_LEDC_CHANNELS];
     uint32_t timer_conf[4];
-    uint32_t timer_active[4];
+    uint32_t timer_active[4];   /* divider and resolution in use */
+    int64_t timer_start[4];     /* when the counter was last zero */
+    int64_t timer_ovf_seen[4];
+    uint32_t timer_paused_count[4];
     uint32_t int_raw;
     uint32_t int_ena;
     uint32_t conf;
@@ -87,6 +94,8 @@ struct ArtemisLedcState {
 /* Duty as a fraction of 65535 and PWM frequency in Hz for a channel output. */
 void artemis_ledc_channel_output(ArtemisLedcState *s, int ch,
                                  uint32_t *duty, uint32_t *freq);
+/* Whether a channel's output is high at this instant. */
+bool artemis_ledc_channel_level(ArtemisLedcState *s, int ch);
 
 /* ------------------------------------------------------------------------ */
 /* GPIO matrix, IO_MUX and RTC_IO                                            */
@@ -126,6 +135,8 @@ struct ArtemisGpioState {
 
     int8_t ext[ARTEMIS_GPIO_COUNT];
     uint64_t level;
+    uint64_t driving;
+    bool in_drive_notify;
     uint32_t published_level[ARTEMIS_GPIO_COUNT];
     uint32_t published_freq[ARTEMIS_GPIO_COUNT];
     bool published_valid[ARTEMIS_GPIO_COUNT];
@@ -137,6 +148,9 @@ struct ArtemisGpioState {
     void *pin_notify_opaque;
     ArtemisWakeNotify wake_notify;
     void *wake_notify_opaque;
+    /* Fired when a pad's level or whether the chip drives it has changed. */
+    ArtemisWakeNotify drive_notify;
+    void *drive_notify_opaque;
 };
 
 /* Drive a pad from outside the chip; ARTEMIS_GPIO_EXT_FLOATING releases it. */
@@ -240,7 +254,11 @@ struct ArtemisUsjState {
     uint32_t conf0;
     uint32_t misc_conf;
     uint32_t mem_conf;
+    uint64_t sof_seen;
 };
+
+/* Power was cut: whatever sat in the transmit FIFO is gone. */
+void artemis_usj_power_cycle(ArtemisUsjState *s);
 
 /* ------------------------------------------------------------------------ */
 /* SAR ADC via the RTC controller                                            */
@@ -336,13 +354,26 @@ struct ArtemisLsm6State {
     float gyro_mdps[3];
     float temp_c;
 
+    /* Property: add the part's typical noise to its samples. */
+    bool noise;
+    uint32_t rng;
+
     int64_t last_tick_ns;
-    int64_t boot_ns;
-    int64_t xl_ready_ns;
-    int64_t g_ready_ns;
-    int64_t t_ready_ns;
+    int64_t timestamp_start_ns;
+    /* When each sensor's sampling clock started, and when its data was last read. */
+    int64_t xl_start_ns;
+    int64_t g_start_ns;
+    int64_t xl_read_ns;
+    int64_t g_read_ns;
+    int64_t t_read_ns;
     uint32_t tilt_hold_ms[6];
     bool tilt_armed[6];
+    float tilt_ref_mg[3];
+    bool tilt_ref_valid;
+    uint32_t tilt_away_ms;
+    uint32_t free_fall_ms;
+    uint32_t still_ms;
+    bool orientation_known;
     uint32_t step_count;
 
     int16_t fifo[ARTEMIS_LSM6_FIFO_WORDS];
@@ -375,10 +406,104 @@ struct ArtemisBm8563State {
     int64_t base_host_ns;
     bool stopped;
     bool low_voltage;
+    /* The weekday register counts on its own, whatever the date says. */
+    uint8_t weekday_shift;
     int64_t timer_deadline_ns;
 };
 
 void artemis_bm8563_set_epoch(ArtemisBm8563State *s, int64_t epoch);
+/* As after the battery was connected: time starts over and is flagged as lost. */
+void artemis_bm8563_power_loss(ArtemisBm8563State *s);
+
+/* ------------------------------------------------------------------------ */
+/* Remote control transceiver                                                */
+
+#define TYPE_ARTEMIS_RMT "artemis.rmt"
+OBJECT_DECLARE_SIMPLE_TYPE(ArtemisRmtState, ARTEMIS_RMT)
+
+#define ARTEMIS_RMT_CHANNELS    8
+#define ARTEMIS_RMT_BLOCK_ITEMS 48
+
+typedef struct ArtemisRmtTx {
+    struct ArtemisRmtState *rmt;
+    QEMUTimer *timer;
+    bool busy;
+    bool waiting;    /* for firmware to refill what a threshold asked for */
+    uint32_t read;   /* next item, counted from the channel's own block */
+    uint32_t write;  /* where a write through the data register lands */
+    uint32_t sent;
+    uint32_t loops;
+    uint32_t event;  /* interrupt bits due when the timer fires */
+} ArtemisRmtTx;
+
+struct ArtemisRmtState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    qemu_irq irq;
+    uint32_t regs[0x100 / 4];
+    uint32_t mem[ARTEMIS_RMT_CHANNELS * ARTEMIS_RMT_BLOCK_ITEMS];
+    ArtemisRmtTx tx[4];
+};
+
+/* ------------------------------------------------------------------------ */
+/* I2S                                                                       */
+
+#define TYPE_ARTEMIS_I2S "artemis.i2s"
+OBJECT_DECLARE_SIMPLE_TYPE(ArtemisI2sState, ARTEMIS_I2S)
+
+typedef struct ArtemisI2sSide {
+    QEMUTimer *timer;
+    bool in_flight;  /* a buffer is on its way out, or being filled */
+    uint32_t chan;   /* the DMA channel it belongs to */
+    uint32_t bytes;
+    int64_t due;
+} ArtemisI2sSide;
+
+struct ArtemisI2sState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    qemu_irq irq;
+    ESPGdmaState *gdma;
+    uint32_t gdma_periph;
+    uint32_t base;
+    uint32_t regs[0x100 / 4];
+    uint32_t writable[0x100 / 4];
+    ArtemisI2sSide tx;
+    ArtemisI2sSide rx;
+    uint8_t buffer[4096];
+};
+
+/* ------------------------------------------------------------------------ */
+/* Plain register storage for unmodelled parts of the chip                   */
+
+#define TYPE_ARTEMIS_SOCREGS "artemis.socregs"
+OBJECT_DECLARE_SIMPLE_TYPE(ArtemisSocRegsState, ARTEMIS_SOCREGS)
+
+/* From the first peripheral to the end of the world controller. */
+#define ARTEMIS_SOCREGS_SIZE 0xD4000
+
+struct ArtemisSocRegsState {
+    SysBusDevice parent_obj;
+
+    MemoryRegion iomem;
+    uint32_t *value;
+    uint32_t *writable;
+    bool *known;
+};
+
+/* Fills a device's own register array, starting at `base`, with reset values. */
+void artemis_socregs_load(uint32_t base, uint32_t *regs, size_t count);
+/* The same, with which bits of each register hold what's written to them. */
+void artemis_socregs_describe(uint32_t base, uint32_t *regs, uint32_t *writable, size_t count);
+/* Puts one peripheral's registers back to their reset values. */
+void artemis_socregs_reset_range(ArtemisSocRegsState *s, uint32_t base, uint32_t size);
+/* Notes where a core was when the chip got reset, if firmware asked for that. */
+void artemis_socregs_record_reset(ArtemisSocRegsState *s, int core, uint32_t pc,
+                                  uint32_t sp);
+/* Power was cut: what was recorded about the last run is gone. */
+void artemis_socregs_power_cycle(ArtemisSocRegsState *s);
 
 /* ------------------------------------------------------------------------ */
 /* Radio register blocks                                                     */
@@ -395,6 +520,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(ArtemisBleState, ARTEMIS_BLE)
 /* Board: power, battery, and the bridge to the emulator's front end          */
 
 #define TYPE_ARTEMIS_BOARD "artemis.board"
+
+/*
+ * How many clock cycles an instruction takes on the watch, on average, with
+ * its flash cache misses and all: what makes emulated code take as long as it
+ * does on the chip. Measured against a watch running MicroPython.
+ */
+#define ARTEMIS_CYCLES_PER_INSN_MILLI 1520
 OBJECT_DECLARE_SIMPLE_TYPE(ArtemisBoardState, ARTEMIS_BOARD)
 
 struct ArtemisBoardState {
@@ -421,6 +553,8 @@ struct ArtemisBoardState {
     uint16_t *frame;
     uint32_t frame_seq;
     bool frame_force;
+
+    uint32_t cycles_per_insn_milli;
 
     /* Electrical state. */
     uint32_t battery_mv;

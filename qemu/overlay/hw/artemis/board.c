@@ -16,7 +16,8 @@
  *   BRIDGE_SET_PIN      u8 pin, i8 level (-1 releases the pad)
  *   BRIDGE_SET_IMU      f32 accel_mg[3], f32 gyro_mdps[3], f32 temp_c
  *   BRIDGE_SET_BATTERY  u16 mv, u8 usb, u8 charging
- *   BRIDGE_SET_RTC      i64 seconds since the epoch, as wall-clock time
+ *   BRIDGE_SET_RTC      i64 seconds since the epoch, as wall-clock time; the
+ *                       lowest value means the clock was never set
  *   BRIDGE_RESET
  *   BRIDGE_REQ_FRAME
  *   BRIDGE_TAP          u8 axis, u8 double
@@ -36,6 +37,9 @@
 #include "hw/qdev-properties-system.h"
 #include "sysemu/runstate.h"
 #include "hw/artemis/artemis.h"
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #define BRIDGE_VERSION 2
 
@@ -65,13 +69,20 @@ enum {
 /*
  * BatteryV3 in the firmware reads the battery through a 1:4 divider with a
  * fixed 75 mV correction; CALIB_EN switches the divider to a 2.5 V reference.
+ * With a cable in, the divider sits on the USB rail behind a Schottky diode
+ * instead of on the battery: this is what a watch measured there.
  */
 #define BATT_DIVIDER 4
 #define BATT_OFFSET_MV 75
 #define VREF_MV 2500
+#define USB_RAIL_MV 4370
+#define PAD_HIGH_MV 3300
 
-/* Code that the emulated eFuse says each attenuation produces at 850 mV. */
-static const uint32_t adc_digi_at_850mv[4] = { 3664, 2785, 1989, 1123 };
+/*
+ * Code each attenuation produces at 850 mV, from a watch's calibration eFuses;
+ * artemis_emu/efuse.py stores the same figures.
+ */
+static const uint32_t adc_digi_at_850mv[4] = { 3659, 2742, 1923, 1017 };
 
 /* ESP-IDF's curve-fitting correction for ADC1, so calibrated reads are exact. */
 static const double adc_error_coef[4][5] = {
@@ -108,13 +119,23 @@ static uint32_t adc_input(void *opaque, int unit, int channel, int atten)
     ArtemisBoardState *s = ARTEMIS_BOARD(opaque);
     double mv = 0;
 
-    /* ADC1 channel n is GPIO n + 1. */
-    if (unit == 1 && channel + 1 == ARTEMIS_PIN_BATTERY_READ) {
+    /* ADC1 channel n is GPIO n + 1, ADC2 channel n is GPIO n + 11. */
+    int pin = unit == 1 ? channel + 1 : channel + 11;
+
+    if (pin == ARTEMIS_PIN_BATTERY_READ) {
         if (artemis_gpio_get_level(s->gpio, ARTEMIS_PIN_CALIB_EN)) {
             mv = (double)VREF_MV / BATT_DIVIDER;
         } else {
-            mv = ((double)s->battery_mv - BATT_OFFSET_MV) / BATT_DIVIDER;
+            double sense = (double)s->battery_mv - BATT_OFFSET_MV;
+
+            if (s->usb_plugged) {
+                sense = MAX(sense, USB_RAIL_MV);
+            }
+            mv = sense / BATT_DIVIDER;
         }
+    } else if (pin < ARTEMIS_GPIO_COUNT && artemis_gpio_get_level(s->gpio, pin)) {
+        /* No analogue source on the other pads: they're at a logic level. */
+        mv = PAD_HIGH_MV;
     }
     return mv_to_adc_code(atten, mv);
 }
@@ -283,11 +304,37 @@ static void imu_interrupt(void *opaque, int n, int level)
                                          : ARTEMIS_PIN_GYRO_INT1, level);
 }
 
+/*
+ * The charger's status pin sinks hard while charging, about 20 uA once the
+ * battery is full, and floats without a supply. The watch pulls that net up
+ * through 300 k and ties it to CHRG_OUT through 2.55 k, so firmware tells
+ * "full" from "charging" by driving CHRG_OUT high and reading CHRG_IN.
+ */
+static void update_charger_nets(void *opaque)
+{
+    ArtemisBoardState *s = ARTEMIS_BOARD(opaque);
+    bool driven = artemis_gpio_is_output(s->gpio, ARTEMIS_PIN_CHRG_OUT);
+    bool driven_high = driven &&
+                       artemis_gpio_get_level(s->gpio, ARTEMIS_PIN_CHRG_OUT);
+    bool level;
+
+    if (s->usb_plugged && s->charging) {
+        level = false;
+    } else if (s->usb_plugged) {
+        level = driven_high;
+    } else {
+        level = !driven || driven_high;
+    }
+
+    artemis_gpio_set_external(s->gpio, ARTEMIS_PIN_CHRG_IN, level);
+    artemis_gpio_set_external(s->gpio, ARTEMIS_PIN_CHRG_OUT,
+                              driven ? ARTEMIS_GPIO_EXT_FLOATING : level);
+}
+
 static void apply_battery(ArtemisBoardState *s)
 {
     artemis_gpio_set_external(s->gpio, ARTEMIS_PIN_USB_DETECT, s->usb_plugged);
-    /* TP4054's CHRG output is open-drain, low while charging. */
-    artemis_gpio_set_external(s->gpio, ARTEMIS_PIN_CHRG_IN, !s->charging);
+    update_charger_nets(s);
     if (s->usb_plugged) {
         power_on(s);
     } else {
@@ -335,7 +382,13 @@ static void handle_message(ArtemisBoardState *s, uint8_t type,
 
     case BRIDGE_SET_RTC:
         if (len >= 8) {
-            artemis_bm8563_set_epoch(s->rtc, ldq_le_p(p));
+            int64_t epoch = ldq_le_p(p);
+
+            if (epoch == INT64_MIN) {
+                artemis_bm8563_power_loss(s->rtc);
+            } else {
+                artemis_bm8563_set_epoch(s->rtc, epoch);
+            }
         }
         break;
 
@@ -460,6 +513,8 @@ void artemis_board_wire(ArtemisBoardState *s, ArtemisGpioState *gpio,
     adc->input_opaque = s;
     gpio->pin_notify = pin_changed;
     gpio->pin_notify_opaque = s;
+    gpio->drive_notify = update_charger_nets;
+    gpio->drive_notify_opaque = s;
 
     qdev_connect_gpio_out_named(DEVICE(gpio), "pad", ARTEMIS_PIN_TFT_DC,
                                 qdev_get_gpio_in_named(DEVICE(panel), "dc", 0));
@@ -478,6 +533,11 @@ void artemis_board_wire(ArtemisBoardState *s, ArtemisGpioState *gpio,
 static void board_realize(DeviceState *dev, Error **errp)
 {
     ArtemisBoardState *s = ARTEMIS_BOARD(dev);
+
+#ifdef __linux__
+    /* Timers are serviced from this thread: don't let the kernel round them up. */
+    prctl(PR_SET_TIMERSLACK, 1);
+#endif
 
     s->tx = g_byte_array_new();
     s->frame = g_malloc0(FRAME_BYTES);
@@ -508,6 +568,9 @@ static Property board_properties[] = {
     DEFINE_PROP_UINT32("battery-mv", ArtemisBoardState, battery_mv, 3900),
     DEFINE_PROP_BOOL("usb", ArtemisBoardState, usb_plugged, false),
     DEFINE_PROP_BOOL("charging", ArtemisBoardState, charging, false),
+    /* Average CPU cycles per instruction, in thousandths; 0 runs unpaced. */
+    DEFINE_PROP_UINT32("cycles-per-insn-milli", ArtemisBoardState,
+                       cycles_per_insn_milli, ARTEMIS_CYCLES_PER_INSN_MILLI),
     DEFINE_PROP_END_OF_LIST(),
 };
 

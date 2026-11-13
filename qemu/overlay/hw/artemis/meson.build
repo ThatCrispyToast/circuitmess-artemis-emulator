@@ -5,10 +5,13 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files(
   'gpio.c',
   'gpspi.c',
   'i2c.c',
+  'i2s.c',
   'ledc.c',
   'lsm6ds3trc.c',
   'radio.c',
+  'rmt.c',
   'saradc.c',
+  'socregs.c',
   'st7735s.c',
   'usj.c',
 ))

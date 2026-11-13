@@ -67,6 +67,8 @@
 #define SIG_GPIO_OUT     256
 #define SIG_LEDC0        73
 
+#define PIN_U0TXD        43
+
 #define MUX_FUN_PD       BIT(7)
 #define MUX_FUN_PU       BIT(8)
 #define MUX_FUN_IE       BIT(9)
@@ -75,6 +77,7 @@
 
 /* RTC_GPIO_IN_REG, RTC_GPIO_OUT_REG and friends. */
 #define A_RTC_GPIO_IN    0x24
+#define RTCIO_BASE       0x60008400
 
 enum {
     INT_NONE = 0,
@@ -85,7 +88,11 @@ enum {
     INT_HIGH = 5,
 };
 
-/* Nets with external pull-ups or pull-downs on the watch. */
+/*
+ * Nets held at a level from outside the chip: pull resistors on the watch, and
+ * the flash and PSRAM lines as they sit between accesses. The charger's nets
+ * are driven by the board model.
+ */
 static const struct {
     int pin;
     int level;
@@ -97,10 +104,32 @@ static const struct {
     { ARTEMIS_PIN_LEVER_PUSH, 0 },
     { ARTEMIS_PIN_BUTTON, 0 },
     { ARTEMIS_PIN_USB_DETECT, 0 },
-    { ARTEMIS_PIN_CHRG_IN, 1 },
-    { ARTEMIS_PIN_CHRG_OUT, 1 },
     { ARTEMIS_PIN_POWEROFF, 1 },
-    { ARTEMIS_PIN_TFT_RST, 1 },
+    { 26, 1 }, { 27, 1 }, { 28, 0 }, { 29, 1 }, { 30, 0 }, { 31, 1 }, { 32, 1 },
+};
+
+/* IO_MUX registers as a watch has them out of reset. */
+static const uint16_t iomux_reset[49] = {
+    0xb02, 0xa02, 0xa02, 0xa02, 0x802, 0x802, 0x802, 0x802, 0x802, 0xa02,
+    0xa02, 0xa02, 0xa02, 0xa02, 0xa02, 0x802, 0x802, 0xa02, 0xa02, 0xc02,
+    0xc02, 0x802, 0x802, 0x802, 0x802, 0x802, 0x1b02, 0x70a, 0x70a, 0x70a,
+    0x70a, 0x70a, 0x70a, 0xa02, 0xa02, 0xa02, 0xa02, 0xa02, 0xa02, 0xa02,
+    0xa02, 0xa02, 0xa02, 0xb02, 0xb02, 0xa82, 0xa82, 0x1a02, 0x1a02,
+};
+
+/*
+ * Peripheral inputs start out tied to a constant: which of the 256 signals
+ * read high (0x3C) and which low (0x38). The rest have no input.
+ */
+#define IN_SEL_HIGH 0x3C
+#define IN_SEL_LOW  0x38
+static const uint32_t in_sel_high[8] = {
+    0xffffff8f, 0x7fffffff, 0x001e02fc, 0x0f007fe0,
+    0xf9ffffee, 0xf003ffff, 0xe01f00ff, 0xf800001f,
+};
+static const uint32_t in_sel_low[8] = {
+    0x00000000, 0x00000000, 0x1e000000, 0x00100000,
+    0x00000000, 0x0ffc0000, 0x1fe00000, 0x00000000,
 };
 
 /* LEDs, RGB and the piezo driver: what the UI shows. */
@@ -111,6 +140,12 @@ static const int visible_pins[] = {
     ARTEMIS_PIN_TFT_BL, ARTEMIS_PIN_BUZZER,
 };
 
+/* UART0's transmitter owns its pad through IO_MUX until firmware moves it. */
+static bool pin_is_uart_tx(ArtemisGpioState *s, int pin)
+{
+    return pin == PIN_U0TXD && !(s->iomux[pin] & MUX_SEL_M);
+}
+
 static bool pin_output_enabled(ArtemisGpioState *s, int pin)
 {
     uint32_t sel = s->func_out_sel[pin];
@@ -118,6 +153,9 @@ static bool pin_output_enabled(ArtemisGpioState *s, int pin)
 
     if (pin >= 49) {
         return false;
+    }
+    if (pin_is_uart_tx(s, pin)) {
+        return true;
     }
 
     /* With OEN_SEL the GPIO_ENABLE bit decides; otherwise the peripheral. */
@@ -140,6 +178,13 @@ static void pin_drive(ArtemisGpioState *s, int pin, uint32_t *level,
     uint32_t duty = 0;
     uint32_t f = 0;
 
+    if (pin_is_uart_tx(s, pin)) {
+        /* The line idles high; the bursts of data aren't worth showing. */
+        *level = 0xFFFF;
+        *freq = 0;
+        return;
+    }
+
     if (sig >= SIG_LEDC0 && sig < SIG_LEDC0 + ARTEMIS_LEDC_CHANNELS && s->ledc) {
         artemis_ledc_channel_output(s->ledc, sig - SIG_LEDC0, &duty, &f);
     } else {
@@ -154,29 +199,65 @@ static void pin_drive(ArtemisGpioState *s, int pin, uint32_t *level,
     *freq = f;
 }
 
-static bool pin_input_level(ArtemisGpioState *s, int pin)
+/* A pad nothing is driving: an outside level, a pull, or else what it last held. */
+static bool pin_undriven_level(ArtemisGpioState *s, int pin)
 {
     uint32_t mux = s->iomux[pin];
-
-    if (pin_output_enabled(s, pin)) {
-        bool open_drain = s->pin[pin] & PIN_PAD_DRIVER;
-        uint32_t duty, freq;
-
-        pin_drive(s, pin, &duty, &freq);
-        if (duty >= 0x8000 && open_drain) {
-            /* Released open-drain line: whoever else holds the net wins. */
-            if (s->ext[pin] != ARTEMIS_GPIO_EXT_FLOATING) {
-                return s->ext[pin];
-            }
-            return mux & MUX_FUN_PU;
-        }
-        return duty >= 0x8000;
-    }
 
     if (s->ext[pin] != ARTEMIS_GPIO_EXT_FLOATING) {
         return s->ext[pin];
     }
-    return mux & MUX_FUN_PU;
+    if (mux & MUX_FUN_PU) {
+        return true;
+    }
+    if (mux & MUX_FUN_PD) {
+        return false;
+    }
+    return s->level >> pin & 1;
+}
+
+/* The PWM channel on a pad's output, or -1. */
+static int pin_ledc_channel(ArtemisGpioState *s, int pin)
+{
+    uint32_t sig = s->func_out_sel[pin] & OUT_SEL_MASK;
+
+    if (s->ledc && !pin_is_uart_tx(s, pin) && sig >= SIG_LEDC0 &&
+        sig < SIG_LEDC0 + ARTEMIS_LEDC_CHANNELS) {
+        return sig - SIG_LEDC0;
+    }
+    return -1;
+}
+
+/*
+ * The level on a pad. PWM edges aren't events in this model, so a PWM output
+ * counts as its average unless the caller wants the waveform sampled.
+ */
+static bool pin_input_level(ArtemisGpioState *s, int pin, bool sample_pwm)
+{
+    if (pin_output_enabled(s, pin)) {
+        bool open_drain = s->pin[pin] & PIN_PAD_DRIVER;
+        int ch = sample_pwm ? pin_ledc_channel(s, pin) : -1;
+        bool high;
+
+        if (ch >= 0) {
+            high = artemis_ledc_channel_level(s->ledc, ch);
+            if (s->func_out_sel[pin] & OUT_INV) {
+                high = !high;
+            }
+        } else {
+            uint32_t duty, freq;
+
+            pin_drive(s, pin, &duty, &freq);
+            high = duty >= 0x8000;
+        }
+        if (high && open_drain) {
+            /* Released open-drain line: whoever else holds the net wins. */
+            return pin_undriven_level(s, pin);
+        }
+        return high;
+    }
+
+    return pin_undriven_level(s, pin);
 }
 
 static uint64_t in_register(ArtemisGpioState *s)
@@ -184,7 +265,15 @@ static uint64_t in_register(ArtemisGpioState *s)
     uint64_t v = 0;
 
     for (int i = 0; i < 49; i++) {
-        if (s->iomux[i] & MUX_FUN_IE && (s->level >> i & 1)) {
+        bool level = s->level >> i & 1;
+
+        if (!(s->iomux[i] & MUX_FUN_IE)) {
+            continue;
+        }
+        if (pin_ledc_channel(s, i) >= 0 && pin_output_enabled(s, i)) {
+            level = pin_input_level(s, i, true);
+        }
+        if (level) {
             v |= 1ULL << i;
         }
     }
@@ -248,7 +337,7 @@ static void update_pads(ArtemisGpioState *s)
     uint64_t now = 0;
 
     for (int i = 0; i < 49; i++) {
-        if (pin_input_level(s, i)) {
+        if (pin_input_level(s, i, false)) {
             now |= 1ULL << i;
         }
     }
@@ -279,6 +368,21 @@ static void update_pads(ArtemisGpioState *s)
     if (changed && s->wake_notify) {
         s->wake_notify(s->wake_notify_opaque);
     }
+
+    /* The board reacts to what the chip drives, not only to levels. */
+    uint64_t driving = 0;
+    for (int i = 0; i < 49; i++) {
+        if (pin_output_enabled(s, i)) {
+            driving |= 1ULL << i;
+        }
+    }
+    if ((changed || driving != s->driving) && s->drive_notify && !s->in_drive_notify) {
+        s->driving = driving;
+        s->in_drive_notify = true;
+        s->drive_notify(s->drive_notify_opaque);
+        s->in_drive_notify = false;
+    }
+    s->driving = driving;
 }
 
 void artemis_gpio_set_external(ArtemisGpioState *s, int pin, int level)
@@ -589,18 +693,18 @@ static void gpio_reset_hold(Object *obj, ResetType type)
     s->bt_select = 0;
     s->sdio_select = 0;
     s->clock_gate = 1;
-    s->pin_ctrl = 0x7FF;
+    s->pin_ctrl = 0x27FF;
     memset(s->pin, 0, sizeof(s->pin));
-    memset(s->func_in_sel, 0, sizeof(s->func_in_sel));
     memset(s->rtcio, 0, sizeof(s->rtcio));
+    artemis_socregs_load(RTCIO_BASE, s->rtcio, ARRAY_SIZE(s->rtcio));
+    for (int i = 0; i < 256; i++) {
+        s->func_in_sel[i] = (in_sel_high[i / 32] >> (i % 32) & 1) ? IN_SEL_HIGH :
+                            (in_sel_low[i / 32] >> (i % 32) & 1) ? IN_SEL_LOW : 0;
+    }
     for (int i = 0; i < ARTEMIS_GPIO_COUNT; i++) {
         s->func_out_sel[i] = SIG_GPIO_OUT;
-        /* GPIO function, input enabled. */
-        s->iomux[i] = (1 << MUX_SEL_S) | MUX_FUN_IE;
+        s->iomux[i] = i < ARRAY_SIZE(iomux_reset) ? iomux_reset[i] : 0x802;
     }
-    /* UART0 pads default to their UART function. */
-    s->iomux[43] &= ~MUX_SEL_M;
-    s->iomux[44] &= ~MUX_SEL_M;
 }
 
 static void gpio_reset_exit(Object *obj, ResetType type)
@@ -646,7 +750,8 @@ static void gpio_init(Object *obj)
 }
 
 static Property gpio_properties[] = {
-    DEFINE_PROP_UINT32("strap_mode", ArtemisGpioState, strap_mode, 0x4),
+    /* GPIO0 high and the other strapping pads low, as the watch boots. */
+    DEFINE_PROP_UINT32("strap_mode", ArtemisGpioState, strap_mode, 0x8),
     DEFINE_PROP_END_OF_LIST(),
 };
 

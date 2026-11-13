@@ -33,6 +33,7 @@
 
 #define SR_RESP_REC      BIT(0)
 #define SR_BUS_BUSY      BIT(4)
+#define SR_STRETCH_CAUSE (3 << 14)
 #define SR_RXFIFO_CNT_S  8
 #define SR_TXFIFO_CNT_S  18
 
@@ -168,7 +169,7 @@ static uint64_t i2c_read(void *opaque, hwaddr addr, unsigned size)
         uint32_t tx = fifo8_num_used(&s->tx_fifo);
         uint32_t rx = fifo8_num_used(&s->rx_fifo);
         return (s->started ? SR_BUS_BUSY : 0) | (rx << SR_RXFIFO_CNT_S) |
-               (tx << SR_TXFIFO_CNT_S);
+               (tx << SR_TXFIFO_CNT_S) | SR_STRETCH_CAUSE;
     }
     case A_FIFO_ST:
         return 0;
@@ -268,6 +269,18 @@ static void i2c_reset_hold(Object *obj, ResetType type)
     memset(s->cmd, 0, sizeof(s->cmd));
     s->int_raw = 0;
     s->int_ena = 0;
+
+    /* What the controller holds out of reset. */
+    s->regs[A_CTR / 4] = 0x20B;
+    s->regs[A_TO / 4] = 0x10;
+    s->regs[A_FIFO_CONF / 4] = 0x408B;
+    for (int reg = 0x40; reg <= 0x4C; reg += 4) {
+        s->regs[reg / 4] = 8;       /* start and stop hold and setup times */
+    }
+    s->regs[0x50 / 4] = 0x300;      /* FILTER_CFG */
+    s->regs[0x54 / 4] = 0x200000;   /* CLK_CONF */
+    s->regs[0x78 / 4] = 0x10;       /* SCL_ST_TIME_OUT */
+    s->regs[0x7C / 4] = 0x10;       /* SCL_MAIN_ST_TIME_OUT */
 }
 
 static void i2c_init(Object *obj)

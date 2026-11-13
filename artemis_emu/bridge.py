@@ -8,9 +8,12 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Callable
+from typing import Callable, Optional
 
 PROTOCOL_VERSION = 2
+
+# What SET_RTC carries for a clock that has never been set.
+RTC_NEVER_SET = -(1 << 63)
 
 
 class Msg(IntEnum):
@@ -110,8 +113,9 @@ class Bridge:
     def set_battery(self, mv: int, usb: bool = False, charging: bool = False) -> None:
         self._send(Msg.SET_BATTERY, struct.pack("<HBB", mv, usb, charging))
 
-    def set_rtc(self, epoch: int) -> None:
-        self._send(Msg.SET_RTC, struct.pack("<q", epoch))
+    def set_rtc(self, epoch: Optional[int]) -> None:
+        """None puts the clock in the state it powers up in: time lost, counting from zero."""
+        self._send(Msg.SET_RTC, struct.pack("<q", RTC_NEVER_SET if epoch is None else epoch))
 
     def reset(self) -> None:
         self._send(Msg.RESET)

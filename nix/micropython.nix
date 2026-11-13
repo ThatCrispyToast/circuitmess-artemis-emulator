@@ -1,6 +1,7 @@
-# CircuitMess's MicroPython for the Artemis Watch, the same image CircuitBlocks
-# runs Python on. They don't publish it, so it's built from their source using the
-# ESP-IDF release and compiler it supports.
+# CircuitMess's MicroPython for their ESP32-S3 devices, the Artemis Watch among them.
+# They don't publish a binary, so it's built from their source using the ESP-IDF
+# release and compiler it supports. The board is the "combined" one they keep
+# current, which carries every device's library and a 2 MB filesystem.
 {
   lib,
   stdenv,
@@ -101,7 +102,7 @@ let
   ]);
 in
 stdenv.mkDerivation {
-  pname = "micropython-cm-artemis";
+  pname = "micropython-circuitmess-s3";
   version = "02bf648";
 
   src = fetchFromGitHub {
@@ -139,10 +140,6 @@ stdenv.mkDerivation {
     echo "v5.0.2" > ../esp-idf/version.txt
     patchShebangs ../esp-idf/tools ../esp-idf/components/esptool_py/esptool
 
-    # CircuitMess documents a program surviving a power cycle, but the published
-    # partition table has nothing MicroPython would mount: give it the data partition.
-    sed -i 's/^spiffs, *data, spiffs,/vfs,      data, fat,   /' ports/esp32/partitions/noota_4MB.csv
-
     # This directive is newer than the compiler that matches this ESP-IDF release.
     sed -i -E 's/^#elifdef (.*)$/#elif defined(\1)/' ports/esp32/cm_boards.c
 
@@ -174,7 +171,7 @@ stdenv.mkDerivation {
 
     cd ports/esp32
     cmake -S . -B build -G Ninja \
-      -DMICROPY_BOARD=CM_Artemis \
+      -DMICROPY_BOARD=CM_-CombinedS3 \
       -DUSER_C_MODULES=$(realpath ../../usermod/micropython.cmake) \
       -DPYTHON_DEPS_CHECKED=1 \
       -DPYTHON=python3 \
@@ -198,7 +195,7 @@ stdenv.mkDerivation {
   '';
 
   meta = {
-    description = "CircuitMess MicroPython firmware for the Artemis Watch";
+    description = "CircuitMess MicroPython firmware for their ESP32-S3 devices";
     license = lib.licenses.mit;
   };
 }

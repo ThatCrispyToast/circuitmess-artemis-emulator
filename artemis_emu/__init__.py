@@ -1,14 +1,20 @@
-"""Emulator for the CircuitMess NASA Artemis Watch 2.0."""
+"""Emulator for the CircuitMess NASA Artemis Watch 2.0, and tools for the real one."""
 
-from .flash import FirmwareError
-from .machine import EmulatorError, Watch
+from .device import Device, DeviceError
+from .firmware import STOCK_VERSIONS, micropython_firmware, stock_firmware
+from .machine import BUTTONS, EmulatorError, Watch
 from .micropython import PythonError, PythonSession, WatchRestarted
 
 __all__ = [
+    "BUTTONS",
+    "Device",
+    "DeviceError",
     "EmulatorError",
-    "FirmwareError",
     "PythonError",
     "PythonSession",
+    "STOCK_VERSIONS",
     "Watch",
     "WatchRestarted",
+    "micropython_firmware",
+    "stock_firmware",
 ]

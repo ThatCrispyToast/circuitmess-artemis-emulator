@@ -165,13 +165,15 @@ class Watch:
         battery_mv: int = 3900,
         usb: bool = False,
         charging: bool = False,
-        time: Optional[Union[dt.datetime, int]] = None,
+        time: Optional[Union[dt.datetime, int, str]] = None,
         flash_file: Optional[Union[str, Path]] = None,
         psram_mb: int = 2,
         console: Optional[Callable[[bytes], None]] = None,
         gdb_port: Optional[int] = None,
         wait_for_gdb: bool = False,
         watchdogs: bool = True,
+        turbo: bool = False,
+        sensor_noise: bool = False,
         qemu_args: Iterable[str] = (),
     ):
         self.firmware = Path(firmware)
@@ -185,6 +187,8 @@ class Watch:
         self.gdb_port = gdb_port
         self.wait_for_gdb = wait_for_gdb
         self.watchdogs = watchdogs
+        self.turbo = turbo
+        self.sensor_noise = sensor_noise
         self.qemu_args = list(qemu_args)
         self._console = console
 
@@ -202,6 +206,8 @@ class Watch:
         self._console_timer: Optional[threading.Thread] = None
         self._stderr = None
         self._exit_status: Optional[int] = None
+        # When the firmware last started from scratch, on time.monotonic()'s clock.
+        self.restarted_at = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -266,6 +272,11 @@ class Watch:
         ]
         if not self.watchdogs:
             args += ["-global", "driver=timer.esp.timg,property=wdt_disable,value=on"]
+        if self.turbo:
+            # Code then runs as fast as this computer manages, not at the watch's speed.
+            args += ["-global", "driver=artemis.board,property=cycles-per-insn-milli,value=0"]
+        if self.sensor_noise:
+            args += ["-global", "driver=artemis.lsm6ds3trc,property=noise,value=on"]
         if self.gdb_port:
             args += ["-gdb", f"tcp::{self.gdb_port}"]
         args += self.qemu_args
@@ -348,10 +359,13 @@ class Watch:
         self._qmp.command("stop")
 
     def resume(self) -> None:
+        if not self.restarted_at:
+            self.restarted_at = time.monotonic()
         self._qmp.command("cont")
 
     def reset(self) -> None:
         """Cuts power and boots again, as holding the chip in reset would."""
+        self.restarted_at = time.monotonic()
         self.bridge.reset()
 
     # ------------------------------------------------------------------
@@ -415,10 +429,18 @@ class Watch:
         self.bridge.set_battery(self.battery_mv, self.usb, self.charging)
         self.bridge.sync()
 
-    def set_time(self, when: Union[dt.datetime, int]) -> None:
-        """Sets the RTC. The firmware shows it as-is, so a datetime means wall-clock time."""
+    def set_time(self, when: Union[dt.datetime, int, str]) -> None:
+        """
+        Sets the RTC. The firmware shows it as-is, so a datetime means wall-clock time.
+        "unset" is a clock that has never been set, as on a watch fresh from its box: it
+        counts up from zero and flags its time as lost.
+        """
         if isinstance(when, dt.datetime):
             epoch = int(when.replace(tzinfo=dt.timezone.utc).timestamp())
+        elif when == "unset":
+            epoch = None
+        elif isinstance(when, str):
+            raise ValueError(f"not a time: {when!r}")
         else:
             epoch = when
         self.bridge.set_rtc(epoch)

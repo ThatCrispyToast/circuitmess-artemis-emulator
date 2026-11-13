@@ -1,6 +1,7 @@
 /*
- * ESP32-S3 SENS block: the SAR ADC as ESP-IDF's oneshot driver reads it, and the
- * internal temperature sensor. Everything else in the block is plain storage.
+ * ESP32-S3 SENS block: the SAR ADC as ESP-IDF's oneshot driver reads it, the
+ * internal temperature sensor, and touch pads that nothing is touching.
+ * Everything else in the block is plain storage.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -15,6 +16,13 @@
 #define A_SAR_ATTEN2      0x38
 #define A_SAR_SLAVE_ADDR1 0x40
 #define A_SAR_TSENS_CTRL  0x50
+#define A_TOUCH_CHN_ST    0x9C
+#define A_TOUCH_STATUS1   0xA4
+#define A_TOUCH_STATUS14  0xD8
+#define SENS_BASE         0x60008800
+
+#define TOUCH_MEAS_DONE   BIT(31)
+#define TOUCH_DATA_M      0x3FFFFF
 
 #define CTRL2_DATA_M    0xFFFF
 #define CTRL2_DONE      BIT(16)
@@ -53,6 +61,12 @@ static void measure(ArtemisSaradcState *s, int unit, uint32_t *reg, uint32_t v)
     *reg = (v & ~(CTRL2_DATA_M | CTRL2_DONE)) | result;
 }
 
+/* Counts an untouched pad gives, pad 1 first: around what a watch reads on its free pads. */
+static const uint16_t touch_idle_counts[14] = {
+    11391, 11468, 11532, 11610, 11344, 11287, 11655,
+    11726, 11204, 11757, 11772, 11498, 11573, 11430,
+};
+
 static uint64_t saradc_read(void *opaque, hwaddr addr, unsigned size)
 {
     ArtemisSaradcState *s = ARTEMIS_SARADC(opaque);
@@ -62,6 +76,10 @@ static uint64_t saradc_read(void *opaque, hwaddr addr, unsigned size)
         v &= ~MEAS_STATUS_M;
     } else if (addr == A_SAR_TSENS_CTRL) {
         v = (v & ~TSENS_OUT_M) | TSENS_READY | TSENS_READING;
+    } else if (addr == A_TOUCH_CHN_ST) {
+        v |= TOUCH_MEAS_DONE;
+    } else if (addr >= A_TOUCH_STATUS1 && addr <= A_TOUCH_STATUS14) {
+        v = (v & ~TOUCH_DATA_M) | touch_idle_counts[(addr - A_TOUCH_STATUS1) / 4];
     }
     return v;
 }
@@ -99,6 +117,7 @@ static void saradc_reset_hold(Object *obj, ResetType type)
     ArtemisSaradcState *s = ARTEMIS_SARADC(obj);
 
     memset(s->regs, 0, sizeof(s->regs));
+    artemis_socregs_load(SENS_BASE, s->regs, ARRAY_SIZE(s->regs));
 }
 
 static void saradc_init(Object *obj)

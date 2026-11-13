@@ -1,3 +1,142 @@
+diff -ruN a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -41,6 +41,11 @@
+ #include "tb-context.h"
+ #include "internal-common.h"
+ #include "internal-target.h"
++#include "qemu/processor.h"
++#include "qemu/timer.h"
++#ifdef __linux__
++#include <sys/prctl.h>
++#endif
+ 
+ /* -icount align implementation. */
+ 
+@@ -900,6 +905,63 @@
+     return false;
+ }
+ 
++bool tcg_insn_pacing;
++uint32_t tcg_insn_pace_ps;
++
++#define PACE_SLICE_INSNS    8192
++/* How far behind its pace a CPU may fall before the debt is written off. */
++#define PACE_MAX_LAG_NS     (500 * SCALE_US)
++/* Waits shorter than this are spun out, for the sake of accuracy. */
++#define PACE_SPIN_NS        (60 * SCALE_US)
++#define PACE_MAX_SLEEP_NS   (200 * SCALE_US)
++
++/* The budget ran out: wait until the instructions run since should be done. */
++static void cpu_insn_pace(CPUState *cpu)
++{
++    const uint32_t ps = qatomic_read(&tcg_insn_pace_ps);
++    const int64_t ran = PACE_SLICE_INSNS - cpu->neg.insn_budget;
++    int64_t now = get_clock();
++    int64_t due;
++
++    cpu->neg.insn_budget = PACE_SLICE_INSNS;
++
++    if (!cpu->insn_pace_started) {
++        cpu->insn_pace_started = true;
++        cpu->insn_pace_due = now;
++#ifdef __linux__
++        /* Short sleeps would otherwise be rounded up by 50 us each. */
++        prctl(PR_SET_TIMERSLACK, 1);
++#endif
++        return;
++    }
++    if (ps == 0) {
++        cpu->insn_pace_due = now;
++        return;
++    }
++
++    due = cpu->insn_pace_due + ran * (int64_t)ps / 1000;
++    if (now - due > PACE_MAX_LAG_NS) {
++        /* It had been idle, or the host can't keep up: start again from here. */
++        due = now;
++    }
++    cpu->insn_pace_due = due;
++
++    /* Anything that wants this CPU's attention ends the wait; the time owed stays owed. */
++    while (now < due && !cpu_loop_exit_requested(cpu)) {
++        const int64_t left = due - now;
++
++        if (left > PACE_SPIN_NS) {
++            const struct timespec ts = {
++                .tv_nsec = MIN(left - PACE_SPIN_NS / 2, PACE_MAX_SLEEP_NS),
++            };
++            nanosleep(&ts, NULL);
++        } else {
++            cpu_relax();
++        }
++        now = get_clock();
++    }
++}
++
+ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
+                                     vaddr pc, TranslationBlock **last_tb,
+                                     int *tb_exit)
+@@ -912,6 +974,12 @@
+     }
+ 
+     *last_tb = NULL;
++    if (cpu->neg.insn_budget < 0) {
++        cpu_insn_pace(cpu);
++        if (!icount_enabled()) {
++            return;
++        }
++    }
+     if (cpu_loop_exit_requested(cpu)) {
+         /* Something asked us to stop executing chained TBs; just
+          * continue round the main loop. Whatever requested the exit
+diff -ruN a/accel/tcg/translator.c b/accel/tcg/translator.c
+--- a/accel/tcg/translator.c
++++ b/accel/tcg/translator.c
+@@ -39,6 +39,9 @@
+     return true;
+ }
+ 
++/* The subtraction of a block's length from its CPU's instruction budget. */
++static __thread TCGOp *pace_insn;
++
+ static TCGOp *gen_tb_start(DisasContextBase *db, uint32_t cflags)
+ {
+     TCGv_i32 count = NULL;
+@@ -81,6 +84,22 @@
+                          - offsetof(ArchCPU, env));
+     }
+ 
++    pace_insn = NULL;
++    if (tcg_insn_pacing) {
++        /* Leave once the budget is spent, otherwise charge this block to it. */
++        TCGv_i32 budget = tcg_temp_new_i32();
++        const intptr_t offset = offsetof(ArchCPU, parent_obj.neg.insn_budget)
++                                - offsetof(ArchCPU, env);
++
++        tcg_gen_ld_i32(budget, tcg_env, offset);
++        if (tcg_ctx->exitreq_label) {
++            tcg_gen_brcondi_i32(TCG_COND_LT, budget, 0, tcg_ctx->exitreq_label);
++        }
++        tcg_gen_sub_i32(budget, budget, tcg_constant_i32(0));
++        pace_insn = tcg_last_op();
++        tcg_gen_st_i32(budget, tcg_env, offset);
++    }
++
+     return icount_start_insn;
+ }
+ 
+@@ -95,6 +114,10 @@
+         tcg_set_insn_param(icount_start_insn, 2,
+                            tcgv_i32_arg(tcg_constant_i32(num_insns)));
+     }
++    if (pace_insn) {
++        tcg_set_insn_param(pace_insn, 2,
++                           tcgv_i32_arg(tcg_constant_i32(num_insns)));
++    }
+ 
+     if (tcg_ctx->exitreq_label) {
+         gen_set_label(tcg_ctx->exitreq_label);
 diff -ruN a/hw/block/m25p80.c b/hw/block/m25p80.c
 --- a/hw/block/m25p80.c
 +++ b/hw/block/m25p80.c
@@ -56,6 +195,174 @@ diff -ruN a/hw/block/m25p80.c b/hw/block/m25p80.c
              s->data[0] = (!!s->quad_enable) << 1;
              s->pos = 0;
              s->len = 1;
+diff -ruN a/hw/dma/esp_gdma.c b/hw/dma/esp_gdma.c
+--- a/hw/dma/esp_gdma.c
++++ b/hw/dma/esp_gdma.c
+@@ -402,6 +402,141 @@
+ 
+ 
+ /**
++ * @brief Where a stream is to carry on from: the link address if the channel has been
++ *        started since the last call, the descriptor after the last one otherwise.
++ */
++static uint32_t esp_gdma_stream_position(ESPGdmaState *s, uint32_t chan, uint32_t dir)
++{
++    DmaConfigState* state = &s->ch_conf[dir][chan];
++    const uint32_t start   = (dir == ESP_GDMA_IN_IDX) ? R_GDMA_IN_LINK_START_MASK   : R_GDMA_OUT_LINK_START_MASK;
++    const uint32_t restart = (dir == ESP_GDMA_IN_IDX) ? R_GDMA_IN_LINK_RESTART_MASK : R_GDMA_OUT_LINK_RESTART_MASK;
++    GdmaLinkedList last;
++
++    if (state->link & start) {
++        state->stream_next = ((ESP_GDMA_RAM_ADDR >> 20) << 20) | FIELD_EX32(state->link, GDMA_OUT_LINK, ADDR);
++    } else if ((state->link & restart) && !state->stream_next && state->bfr_desc_addr) {
++        /* A list that had run out may have been extended since */
++        if (esp_gdma_read_descr(s, state->bfr_desc_addr, &last)) {
++            state->stream_next = last.next_addr;
++        }
++    }
++    state->link &= ~(start | restart);
++
++    return state->stream_next;
++}
++
++
++int esp_gdma_stream_out(ESPGdmaState *s, uint32_t chan, uint8_t *buffer, uint32_t size)
++{
++    DmaConfigState* state = &s->ch_conf[ESP_GDMA_OUT_IDX][chan];
++    const uint32_t addr = esp_gdma_stream_position(s, chan, ESP_GDMA_OUT_IDX);
++    GdmaLinkedList node;
++
++    if (addr == 0) {
++        return -1;
++    }
++
++    if (!esp_gdma_read_descr(s, addr, &node) ||
++        (FIELD_EX32(state->conf1, GDMA_OUT_CONF1, CHECK_OWNER) && !node.config.owner) ||
++        !esp_gdma_read_guest(s, node.buf_addr, buffer, MIN(node.config.length, size)))
++    {
++        esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_OUT_DSCR_ERR_MASK);
++        state->stream_next = 0;
++        return -1;
++    }
++
++    esp_gdma_push_descriptor(s, chan, ESP_GDMA_OUT_IDX, addr);
++    state->stream_desc = addr;
++    state->stream_next = node.next_addr;
++
++    return MIN(node.config.length, size);
++}
++
++
++void esp_gdma_stream_out_done(ESPGdmaState *s, uint32_t chan)
++{
++    DmaConfigState* state = &s->ch_conf[ESP_GDMA_OUT_IDX][chan];
++    uint32_t status = R_GDMA_INTERRUPT_OUT_DONE_MASK;
++    GdmaLinkedList node;
++
++    if (state->stream_desc == 0 || !esp_gdma_read_descr(s, state->stream_desc, &node)) {
++        return;
++    }
++
++    if (FIELD_EX32(state->conf0, GDMA_OUT_CONF0, AUTO_WRBACK)) {
++        node.config.owner = 0;
++        esp_gdma_write_descr(s, state->stream_desc, &node);
++    }
++
++    /* The descriptor firmware asked to hear about: it can find which one in the EOF register */
++    if (node.config.suc_eof) {
++        state->suc_eof_desc_addr = state->stream_desc;
++        status |= R_GDMA_INTERRUPT_OUT_EOF_MASK;
++    }
++    if (state->stream_next == 0) {
++        status |= R_GDMA_INTERRUPT_OUT_TOTAL_EOF_MASK;
++    }
++    state->stream_desc = 0;
++    esp_gdma_set_status(&state->int_state, status);
++}
++
++
++int esp_gdma_stream_in_room(ESPGdmaState *s, uint32_t chan)
++{
++    DmaConfigState* state = &s->ch_conf[ESP_GDMA_IN_IDX][chan];
++    const uint32_t addr = esp_gdma_stream_position(s, chan, ESP_GDMA_IN_IDX);
++    GdmaLinkedList node;
++
++    if (addr == 0) {
++        return -1;
++    }
++
++    if (!esp_gdma_read_descr(s, addr, &node) ||
++        (FIELD_EX32(state->conf1, GDMA_IN_CONF1, CHECK_OWNER) && !node.config.owner))
++    {
++        esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_IN_DSCR_ERR_MASK);
++        state->stream_next = 0;
++        return -1;
++    }
++
++    return node.config.size;
++}
++
++
++void esp_gdma_stream_in(ESPGdmaState *s, uint32_t chan, const uint8_t *buffer, uint32_t size)
++{
++    DmaConfigState* state = &s->ch_conf[ESP_GDMA_IN_IDX][chan];
++    const uint32_t addr = state->stream_next;
++    uint32_t status = R_GDMA_INTERRUPT_IN_DONE_MASK | R_GDMA_INTERRUPT_IN_SUC_EOF_MASK;
++    GdmaLinkedList node;
++
++    if (addr == 0 || !esp_gdma_read_descr(s, addr, &node)) {
++        return;
++    }
++
++    size = MIN(size, node.config.size);
++    if (!esp_gdma_write_guest(s, node.buf_addr, (void *) buffer, size)) {
++        esp_gdma_set_status(&state->int_state, R_GDMA_INTERRUPT_IN_DSCR_ERR_MASK);
++        state->stream_next = 0;
++        return;
++    }
++
++    esp_gdma_push_descriptor(s, chan, ESP_GDMA_IN_IDX, addr);
++    node.config.length = size;
++    node.config.owner = 0;
++    node.config.suc_eof = 1;
++    esp_gdma_write_descr(s, addr, &node);
++
++    state->suc_eof_desc_addr = addr;
++    state->stream_next = node.next_addr;
++    if (state->stream_next == 0) {
++        status |= R_GDMA_INTERRUPT_IN_DSCR_EMPTY_MASK;
++    }
++    esp_gdma_set_status(&state->int_state, status);
++}
++
++
++/**
+  * @brief Write data to the guest RAM pointed by the linked list configured in the given DmaConfigState index.
+  *        `size` bytes from `buffer` will be written to guest machine's RAM.
+  */
+@@ -791,6 +926,8 @@
+                 FIELD_EX32(s->conf0, GDMA_IN_CONF0, RST) != 0)
+             {
+                 esp_gdma_reset_fifo(s);
++                s->stream_desc = 0;
++                s->stream_next = 0;
+             }
+             /* Update the register before going further */
+             s->conf0 = value;
+@@ -813,6 +950,13 @@
+             {
+                 esp_gdma_check_and_start_mem_transfer(state, chan);
+             }
++            /* Stopping ends a stream, and like the chip's, the bit doesn't stay set */
++            if (value & ((dir == ESP_GDMA_IN_IDX) ? R_GDMA_IN_LINK_STOP_MASK : R_GDMA_OUT_LINK_STOP_MASK))
++            {
++                s->link &= (dir == ESP_GDMA_IN_IDX) ? R_GDMA_IN_LINK_ADDR_MASK : R_GDMA_OUT_LINK_ADDR_MASK;
++                s->stream_desc = 0;
++                s->stream_next = 0;
++            }
+             break;
+ 
+         case GDMA_CONF1_REG:
 diff -ruN a/hw/meson.build b/hw/meson.build
 --- a/hw/meson.build
 +++ b/hw/meson.build
@@ -132,7 +439,7 @@ diff -ruN a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
      }
      return r;
  }
-@@ -142,9 +187,125 @@
+@@ -142,9 +187,126 @@
      case A_RTC_CNTL_STORE7:
          s->scratch_reg[(addr - A_RTC_CNTL_STORE4) / 4 + 4] = value;
          break;
@@ -253,12 +560,13 @@ diff -ruN a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
 +    s->sleeping = false;
 +    timer_del(s->sleep_timer);
 +    memset(s->regs, 0, sizeof(s->regs));
++    artemis_socregs_load(DR_REG_RTCCNTL_BASE, s->regs, ARRAY_SIZE(s->regs));
 +}
 +
  static void esp32s3_rtc_update_cpu_stall(Esp32s3RtcCntlState* s)
  {
      uint32_t procpu_stall = (FIELD_EX32(s->sw_cpu_stall_reg, RTC_CNTL_SW_CPU_STALL, PROCPU_C1) << 2) |
-@@ -164,7 +325,7 @@
+@@ -164,7 +326,7 @@
  
  static void esp32s3_rtc_update_clk(Esp32s3RtcCntlState* s)
  {
@@ -267,12 +575,13 @@ diff -ruN a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
      const uint32_t fastclk_freq[] = {s->xtal_apb_freq / 4, 8000000};
      s->rtc_slowclk_freq = slowclk_freq[s->rtc_slowclk];
      s->rtc_fastclk_freq = fastclk_freq[s->rtc_fastclk];
-@@ -201,6 +362,8 @@
+@@ -201,6 +363,9 @@
      qdev_init_gpio_out_named(DEVICE(sbd), &s->cpu_reset_req[0], ESP32S3_RTC_CPU_RESET_GPIO, ESP32S3_CPU_COUNT);
      qdev_init_gpio_out_named(DEVICE(sbd), &s->cpu_stall_req[0], ESP32S3_RTC_CPU_STALL_GPIO, ESP32S3_CPU_COUNT);
      qdev_init_gpio_out_named(DEVICE(sbd), &s->clk_update, ESP32S3_RTC_CLK_UPDATE_GPIO, 1);
 +    qdev_init_gpio_out_named(DEVICE(sbd), &s->sleep_stall, ESP32S3_RTC_SLEEP_STALL_GPIO, 1);
 +    s->sleep_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32s3_rtc_sleep_timer_cb, s);
++    artemis_socregs_load(DR_REG_RTCCNTL_BASE, s->regs, ARRAY_SIZE(s->regs));
  
      for (int i = 0; i < ESP32S3_CPU_COUNT; ++i) {
          s->reset_cause[i] = ESP32_POWERON_RESET;
@@ -302,10 +611,186 @@ diff -ruN a/hw/timer/esp_systimer.c b/hw/timer/esp_systimer.c
      counter->base = now;
  }
  
+@@ -77,22 +78,20 @@
+     esp_systimer_set_irqs(s);
+ 
+     /* Check if we have to reload the comparator's timer */
+-    if (counter->enabled && comparator->period_mode) {
+-        /**
+-         * If the timer is periodic, we have to compensate the delay that may have been taken
+-         * by QEMU framework. Indeed, this timer may have been triggered too late (tenth of us)
+-         * As such, compensate here by triggering the next timer earlier.
++    if (counter->enabled && comparator->period_mode && comparator->period) {
++        /*
++         * The next match is one period of counts after this one, however late
++         * this callback ran: the alarm keeps its phase against the counter,
++         * which is what firmware relies on to tell which tick it is handling.
+          */
+-        const int64_t diff_ns = now - comparator->expire_time;
+-        const int64_t target_ns = now + TICKS_TO_NS(comparator->period);
+-        int64_t adjusted_target_ns = target_ns;
++        do {
++            comparator->target = (comparator->target + comparator->period) & ESP_SYSTIMER_52BIT_MASK;
++        } while (((comparator->target - counter->value) & ESP_SYSTIMER_52BIT_MASK) > ESP_SYSTIMER_52BIT_MASK / 2);
+ 
+-        if (diff_ns < target_ns) {
+-            adjusted_target_ns = target_ns - diff_ns;
+-        }
++        const uint64_t ticks = (comparator->target - counter->value) & ESP_SYSTIMER_52BIT_MASK;
+ 
+-        comparator->expire_time = adjusted_target_ns;
+-        timer_mod_ns(&comparator->qtimer, adjusted_target_ns);
++        comparator->expire_time = now + TICKS_TO_NS(ticks);
++        timer_mod_ns(&comparator->qtimer, comparator->expire_time);
+     }
+ }
+ 
+@@ -110,9 +109,6 @@
+     ESPSysTimerState *s = comparator->systimer;
+     ESPSysTimerCounter* counter = &s->counter[counter_idx];
+ 
+-    /* Update the counter to get the latest value */
+-    esp_systimer_update_counter(counter);
+-
+     /* If the counter we have to compare it to is not enabled, do not program any timer */
+     if (!counter->enabled) {
+         /* "Disable" the timer */
+@@ -120,6 +116,9 @@
+         return;
+     }
+ 
++    /* Update the counter to get the latest value; a stopped one mustn't move */
++    esp_systimer_update_counter(counter);
++
+     /**
+      * According to the TRM, if the comparator (alarm) is smaller than the counter value and the
+      * difference is bigger or equal to (2^51) - 1, the alarm is not triggered right now and the counter
+@@ -139,7 +138,11 @@
+     uint64_t diff = 0;
+ 
+     if (comparator->period_mode) {
+-        diff = comparator->period;
++        /* A match that the counter was moved past happens right away. */
++        diff = (comparator->target - count_val) & ESP_SYSTIMER_52BIT_MASK;
++        if (diff > ESP_SYSTIMER_52BIT_MASK / 2) {
++            diff = 0;
++        }
+     } else if (overflow_valid) {
+         diff = ((ESP_SYSTIMER_52BIT_MASK + 1) - count_val) + alarm;
+     } else {
+@@ -173,6 +176,13 @@
+ }
+ 
+ 
++/* The count the comparator will next match at. */
++static uint64_t esp_systimer_real_target(ESPSysTimerComp *comp)
++{
++    return comp->period_mode ? comp->target : comp->value;
++}
++
++
+ static uint64_t esp_systimer_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+     ESPSysTimerState *s = ESP_SYSTIMER(opaque);
+@@ -273,24 +283,24 @@
+             break;
+ 
+         case A_SYSTIMER_REAL_TARGET0_HI:
+-            r = SYSTIMER_GET_REG(s->comparators[0].value, 32, R_SYSTIMER_REAL_TARGET0_HI_HI_MASK);
++            r = SYSTIMER_GET_REG(esp_systimer_real_target(&s->comparators[0]), 32, R_SYSTIMER_REAL_TARGET0_HI_HI_MASK);
+             break;
+         case A_SYSTIMER_REAL_TARGET0_LO:
+-            r = SYSTIMER_GET_REG(s->comparators[0].value, 0, R_SYSTIMER_REAL_TARGET0_LO_LO_MASK);
++            r = SYSTIMER_GET_REG(esp_systimer_real_target(&s->comparators[0]), 0, R_SYSTIMER_REAL_TARGET0_LO_LO_MASK);
+             break;
+ 
+         case A_SYSTIMER_REAL_TARGET1_HI:
+-            r = SYSTIMER_GET_REG(s->comparators[1].value, 32, R_SYSTIMER_REAL_TARGET1_HI_HI_MASK);
++            r = SYSTIMER_GET_REG(esp_systimer_real_target(&s->comparators[1]), 32, R_SYSTIMER_REAL_TARGET1_HI_HI_MASK);
+             break;
+         case A_SYSTIMER_REAL_TARGET1_LO:
+-            r = SYSTIMER_GET_REG(s->comparators[1].value, 0, R_SYSTIMER_REAL_TARGET1_LO_LO_MASK);
++            r = SYSTIMER_GET_REG(esp_systimer_real_target(&s->comparators[1]), 0, R_SYSTIMER_REAL_TARGET1_LO_LO_MASK);
+             break;
+ 
+         case A_SYSTIMER_REAL_TARGET2_HI:
+-            r = SYSTIMER_GET_REG(s->comparators[2].value, 32, R_SYSTIMER_REAL_TARGET2_HI_HI_MASK);
++            r = SYSTIMER_GET_REG(esp_systimer_real_target(&s->comparators[2]), 32, R_SYSTIMER_REAL_TARGET2_HI_HI_MASK);
+             break;
+         case A_SYSTIMER_REAL_TARGET2_LO:
+-            r = SYSTIMER_GET_REG(s->comparators[2].value, 0, R_SYSTIMER_REAL_TARGET2_LO_LO_MASK);
++            r = SYSTIMER_GET_REG(esp_systimer_real_target(&s->comparators[2]), 0, R_SYSTIMER_REAL_TARGET2_LO_LO_MASK);
+             break;
+ 
+ 
+@@ -361,9 +371,17 @@
+ 
+ static void esp_systimer_comparator_reload(ESPSysTimerComp* comparator)
+ {
++    ESPSysTimerCounter* counter = &comparator->systimer->counter[comparator->counter];
++
+     comparator->period = comparator->period_toload;
+     comparator->value = comparator->value_toload;
+ 
++    /* Periodic alarms count their period from the counter's value at this load. */
++    if (counter->enabled) {
++        esp_systimer_update_counter(counter);
++    }
++    comparator->target = (counter->value + comparator->period) & ESP_SYSTIMER_52BIT_MASK;
++
+     if (comparator->enabled) {
+         /* The period changed, reprogram the QEMU timer */
+         esp_systimer_comparator_reprogram(comparator);
+@@ -378,9 +396,20 @@
+ 
+     for (int i = 0; i < ESP_SYSTIMER_COUNTER_COUNT; i++) {
+         state_counter[i] = s->counter[i].enabled;
++        /* A counter being stopped keeps the value it has reached. */
++        if (s->counter[i].enabled) {
++            esp_systimer_update_counter(&s->counter[i]);
++        }
+     }
+     s->counter[0].enabled = (value & R_SYSTIMER_CONF_TIMER_UNIT0_WORK_EN_MASK) ? 1 : 0;
+     s->counter[1].enabled = (value & R_SYSTIMER_CONF_TIMER_UNIT1_WORK_EN_MASK) ? 1 : 0;
++    for (int i = 0; i < ESP_SYSTIMER_COUNTER_COUNT; i++) {
++        /* And one being started counts on from its value, not from when it last ran. */
++        if (s->counter[i].enabled && !state_counter[i]) {
++            s->counter[i].base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++            s->counter[i].fraction = 0;
++        }
++    }
+     s->counter[0].core0_stall_en = (value & R_SYSTIMER_CONF_TIMER_UNIT0_CORE0_STALL_EN_MASK) ? 1 : 0;
+     s->counter[1].core0_stall_en = (value & R_SYSTIMER_CONF_TIMER_UNIT1_CORE0_STALL_EN_MASK) ? 1 : 0;
+     s->counter[0].core1_stall_en = (value & R_SYSTIMER_CONF_TIMER_UNIT0_CORE1_STALL_EN_MASK) ? 1 : 0;
 diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
 --- a/hw/timer/esp_timg.c
 +++ b/hw/timer/esp_timg.c
-@@ -210,7 +210,7 @@
+@@ -98,8 +98,9 @@
+         [ESP_TIMG_CALI_RC_FAST_DIV_CLK] = ESP_RC_FAST_DIV_FREQ,
+         [ESP_TIMG_CALI_XTAL32K_CLK]     = ESP_XTAL32K_FREQ
+     };
+-    /* Copy the new value to the register but keep RDY bit to 0 (read-only) */
+-    value &= ~(R_TIMG_RTCCALICFG_RDY_MASK);
++    /* RDY is read-only: it stays up from one calibration until the next starts */
++    value = (value & ~R_TIMG_RTCCALICFG_RDY_MASK) |
++            (s->rtc.rtc_cali_cfg & R_TIMG_RTCCALICFG_RDY_MASK);
+ 
+     /* Check if a start (one-time or periodic) was triggered */
+     if (value & (R_TIMG_RTCCALICFG_START_MASK | R_TIMG_RTCCALICFG_START_CYCLING_MASK)) {
+@@ -138,7 +139,11 @@
+ 
+     s->rtc.rtc_cali_cfg_timeout = value & ~(R_TIMG_RTCCALICFG2_TIMEOUT_MASK);
+ 
+-    if (rst_cnt == 0 || (rst_cnt < count / 10))
++    /* A cycling calibration that never completed is what firmware shortens the timeout to get rid of */
++    const bool stale_cycle = (s->rtc.rtc_cali_cfg & R_TIMG_RTCCALICFG_START_CYCLING_MASK) &&
++                             !(s->rtc.rtc_cali_cfg & R_TIMG_RTCCALICFG_RDY_MASK);
++
++    if (rst_cnt == 0 || (rst_cnt < count / 10) || stale_cycle)
+     {
+         s->rtc.rtc_cali_cfg_timeout |= R_TIMG_RTCCALICFG2_TIMEOUT_MASK;
+     }
+@@ -210,7 +215,7 @@
          /* Avoid any divide-by-0 error in the code below */
          wdt->prescaler = 1;
      } else {
@@ -314,7 +799,7 @@ diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
      }
  
      /* Recalculate the frequency out of the new prescaler and current clock */
-@@ -264,7 +264,7 @@
+@@ -264,7 +269,7 @@
      const bool enabled = FIELD_EX32(value, TIMG_WDTCONFIG0, EN) ? true : false;
      const bool enabled_changed = FIELD_EX32(former_conf, TIMG_WDTCONFIG0, EN) != enabled;
  
@@ -323,7 +808,7 @@ diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
          /* If the prescaler value or the source clock changed update the timer */
          if ((FIELD_EX32(wdt->prescaler_mirror, TIMG_WDTCONFIG1, CLK_PRESCALE) != wdt->prescaler) ||
              (FIELD_EX32(former_conf, TIMG_WDTCONFIG0, USE_XTAL) != FIELD_EX32(value, TIMG_WDTCONFIG0, USE_XTAL)))
-@@ -278,11 +278,6 @@
+@@ -278,11 +283,6 @@
          wdt->stage_conf[2] = FIELD_EX32(value, TIMG_WDTCONFIG0, STG2);
          wdt->stage_conf[3] = FIELD_EX32(value, TIMG_WDTCONFIG0, STG3);
  
@@ -335,7 +820,17 @@ diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
      }
  
      /* Check if the enabled bit changed */
-@@ -672,13 +667,21 @@
+@@ -511,6 +511,9 @@
+         case A_TIMG_RTCCALICFG2:
+             r = s->rtc.rtc_cali_cfg_timeout;
+             break;
++        case A_TIMG_NTIMG_DATE:
++            r = 0x02003071;
++            break;
+ 
+ 
+         /* Timer (T0) related registers */
+@@ -672,13 +675,21 @@
              esp_wdt_update_config(&s->wdt, value);
              break;
          case A_TIMG_WDTCONFIG1:
@@ -359,7 +854,7 @@ diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
              break;
          case A_TIMG_WDTFEED:
              esp_wdt_feed(&s->wdt);
-@@ -747,10 +750,60 @@
+@@ -747,20 +758,75 @@
  };
  
  
@@ -419,7 +914,46 @@ diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
 +
      /* Reset watchdog */
      esp_virtual_counter_reset(&s->wdt.counter);
-     s->wdt.config0 = 0;
+-    s->wdt.config0 = 0;
++    /* Flash boot mode and both reset lengths; nothing here acts on them */
++    s->wdt.config0 = 0x4C000;
+     s->wdt.wkey = ESP_WDT_DEFAULT_WKEY;
+     s->wdt.current_stage = 0;
+     memset(&s->wdt.stage_conf, 0, sizeof(s->wdt.stage_conf));
+     s->wdt.stage[0] = 26000000;
+-    s->wdt.stage[1] = 0x7FFFFFFF;
+-    s->wdt.stage[2] = 0x0FFFFFFF;
+-    s->wdt.stage[3] = 0x0FFFFFFF;
++    s->wdt.stage[1] = 0x7FFFFFF;
++    s->wdt.stage[2] = 0xFFFFF;
++    s->wdt.stage[3] = 0xFFFFF;
++    memcpy(s->wdt.stage_mirror, s->wdt.stage, sizeof(s->wdt.stage_mirror));
++    /* Cycling calibration of the slow RC clock, never started */
++    s->rtc.rtc_cali_cfg = 0x13000;
++    s->rtc.rtc_cali_cfg_timeout = 0xFFFFFF98;
+     s->wdt.prescaler = 1;
+     s->wdt.raw_st = 0;
+     s->wdt.int_enabled = 0;
+@@ -770,15 +836,16 @@
+     s->t0.raw_st = 0;
+     s->t0.int_enabled = 0;
+     s->t0.value_rel = 0;
+-    /* Set the divider to 1 */
+-    s->t0.config = 1 << R_TIMG_T0CONFIG_DIVIDER_SHIFT;
++    /* Counting up with auto-reload, divider 1 */
++    s->t0.config = R_TIMG_T0CONFIG_INCREASE_MASK | R_TIMG_T0CONFIG_AUTORELOAD_MASK |
++                   1 << R_TIMG_T0CONFIG_DIVIDER_SHIFT;
+ 
+     /* Reset Timer1 even if the target doesn't have T1 */
+     esp_virtual_counter_reset(&s->t1.counter);
+     s->t1.raw_st = 0;
+     s->t1.int_enabled = 0;
+     s->t1.value_rel = 0;
+-    s->t1.config = 1 << R_TIMG_T0CONFIG_DIVIDER_SHIFT;
++    s->t1.config = s->t0.config;
+ }
+ 
+ 
 diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
 --- a/hw/xtensa/esp32s3.c
 +++ b/hw/xtensa/esp32s3.c
@@ -432,23 +966,85 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
  
  #define TYPE_ESP32S3_SOC "xtensa.esp32s3"
  #define ESP32S3_SOC(obj) OBJECT_CHECK(Esp32s3SocState, (obj), TYPE_ESP32S3_SOC)
-@@ -122,7 +124,14 @@
+@@ -114,6 +116,57 @@
+ 
+ #define ESP32S3_IO_WARNING  0
+ 
++/*
++ * A peripheral held in reset, or without its clock, doesn't take writes, and
++ * some read as nothing while in reset: each of these was tried on a watch. A
++ * gate lies over the block for as long as that's so.
++ */
++typedef struct Esp32s3PeriphGateInfo {
++    const char *name;
++    hwaddr base;
++    int reg;                /* SYSTEM_PERIP_CLK_EN0 and RST_EN0, or the EN1 pair */
++    int bit;
++    bool blank_in_reset;
++    bool unclocked_writes;
++} Esp32s3PeriphGateInfo;
++
++static const Esp32s3PeriphGateInfo esp32s3_periph_gates[] = {
++    { "gate.uart0", DR_REG_UART_BASE, 0, 2, true },
++    { "gate.i2s0", DR_REG_I2S_BASE, 0, 4, true },
++    { "gate.uart1", DR_REG_UART1_BASE, 0, 5, true },
++    { "gate.spi2", DR_REG_SPI2_BASE, 0, 6, true },
++    { "gate.i2c0", DR_REG_I2C_EXT_BASE, 0, 7, false },
++    { "gate.uhci0", DR_REG_UHCI0_BASE, 0, 8, true },
++    { "gate.rmt", DR_REG_RMT_BASE, 0, 9, true },
++    { "gate.pcnt", DR_REG_PCNT_BASE, 0, 10, false },
++    { "gate.ledc", DR_REG_LEDC_BASE, 0, 11, false },
++    { "gate.spi3", DR_REG_SPI3_BASE, 0, 16, true },
++    { "gate.pwm0", DR_REG_PWM0_BASE, 0, 17, false },
++    { "gate.i2c1", DR_REG_I2C1_EXT_BASE, 0, 18, false },
++    { "gate.pwm1", DR_REG_PWM1_BASE, 0, 20, false },
++    { "gate.i2s1", DR_REG_I2S1_BASE, 0, 21, true },
++    { "gate.saradc", DR_REG_APB_SARADC_BASE, 0, 28, false, true },
++    { "gate.gdma", DR_REG_GDMA_BASE, 1, 6, true },
++    { "gate.lcd_cam", DR_REG_LCD_CAM_BASE, 1, 8, true },
++    { "gate.uart2", DR_REG_UART2_BASE, 1, 9, true },
++};
++
++#define ESP32S3_PERIPH_SIZE  0x1000
++
++typedef struct Esp32s3PeriphGate {
++    MemoryRegion mr;
++    const Esp32s3PeriphGateInfo *info;
++    bool in_reset;
++    /* What the block is made of, for the accesses that still get through. */
++    struct {
++        hwaddr start;
++        hwaddr size;
++        MemoryRegion *mr;
++        hwaddr offset;
++    } under[4];
++    int under_count;
++} Esp32s3PeriphGate;
++
+ typedef struct Esp32s3SocState {
+     /*< private >*/
+     DeviceState parent_obj;
+@@ -122,7 +175,18 @@
      XtensaCPU cpu[ESP32S3_CPU_COUNT];
      Esp32s3IntMatrixState intmatrix;
      ESP32S3UARTState uart[ESP32S3_UART_COUNT];
 -    ESP32S3GPIOState gpio;
 +    ArtemisGpioState gpio;
 +    ArtemisLedcState ledc;
++    ArtemisRmtState rmt;
++    ArtemisI2sState i2s[2];
 +    ArtemisGpspiState gpspi[2];
 +    ArtemisI2cState i2c[2];
 +    ArtemisUsjState usj;
++    ArtemisSocRegsState socregs;
 +    ArtemisSaradcState saradc;
 +    ArtemisBoardState board;
++    Esp32s3PeriphGate gates[ARRAY_SIZE(esp32s3_periph_gates)];
 +    ArtemisRadioState *radio;
      Esp32s3RngState rng;
      Esp32S3TWAIState twai;
  
-@@ -148,7 +157,6 @@
+@@ -148,7 +212,6 @@
      ESP32S3TimgState timg[2];
      ESP32S3SysTimerState systimer;
  
@@ -456,7 +1052,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      ESPRgbState rgb;
  
      MemoryRegion iomem;
-@@ -157,6 +165,7 @@
+@@ -157,6 +220,7 @@
      SsiPsramState *psram;
  
      uint32_t requested_reset;
@@ -464,7 +1060,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
  } Esp32s3SocState;
  
  
-@@ -182,7 +191,7 @@
+@@ -182,7 +246,7 @@
  {
      Esp32s3SocState *s = ESP32S3_SOC(opaque);
      if (level) {
@@ -473,7 +1069,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
          qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
      }
  }
-@@ -191,7 +200,7 @@
+@@ -191,7 +255,7 @@
  {
      Esp32s3SocState *s = ESP32S3_SOC(opaque);
      if (level) {
@@ -482,7 +1078,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
          /* Use different cause for APP CPU so that its reset doesn't cause QEMU to exit,
           * when -no-reboot option is given.
           */
-@@ -207,6 +216,7 @@
+@@ -207,17 +271,20 @@
          s->requested_reset = ESP32S3_SOC_RESET_ALL;
      }
      if (s->requested_reset & ESP32S3_SOC_RESET_PERIPH) {
@@ -490,7 +1086,20 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
          device_cold_reset(DEVICE(&s->intmatrix));
          for (int i = 0; i < ESP32S3_UART_COUNT; ++i) {
              device_cold_reset(DEVICE(&s->uart[i]));
-@@ -225,8 +235,70 @@
+         }
+     }
+     if (s->requested_reset & ESP32S3_SOC_RESET_PROCPU) {
++        artemis_socregs_record_reset(&s->socregs, 0, s->cpu[0].env.pc, s->cpu[0].env.regs[1]);
+         xtensa_select_static_vectors(&s->cpu[0].env, s->rtc_cntl.stat_vector_sel[0]);
+         remove_cpu_watchpoints(&s->cpu[0]);
+         cpu_reset(CPU(&s->cpu[0]));
+     }
+     if (s->requested_reset & ESP32S3_SOC_RESET_APPCPU && (ESP32S3_CPU_COUNT > 1)) {
++        artemis_socregs_record_reset(&s->socregs, 1, s->cpu[1].env.pc, s->cpu[1].env.regs[1]);
+         xtensa_select_static_vectors(&s->cpu[1].env, s->rtc_cntl.stat_vector_sel[1]);
+         remove_cpu_watchpoints(&s->cpu[1]);
+         cpu_reset(CPU(&s->cpu[1]));
+@@ -225,8 +292,72 @@
      s->requested_reset = 0;
  }
  
@@ -557,11 +1166,213 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
 +        qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_UI);
 +    } else {
 +        esp32s3_gate_cores(s, true);
++        artemis_usj_power_cycle(&s->usj);
++        artemis_socregs_power_cycle(&s->socregs);
 +    }
  }
  
  static void esp32s3_clk_update(void* opaque, int n, int level)
-@@ -313,6 +385,112 @@
+@@ -236,6 +367,199 @@
+     }
+ }
+ 
++static bool esp32s3_gate_under(Esp32s3PeriphGate *g, hwaddr addr,
++                               MemoryRegion **mr, hwaddr *offset)
++{
++    for (int i = 0; i < g->under_count; i++) {
++        if (addr >= g->under[i].start && addr - g->under[i].start < g->under[i].size) {
++            *mr = g->under[i].mr;
++            *offset = g->under[i].offset + addr - g->under[i].start;
++            return true;
++        }
++    }
++    return false;
++}
++
++static uint64_t esp32s3_gate_read(void *opaque, hwaddr addr, unsigned size)
++{
++    Esp32s3PeriphGate *g = opaque;
++    MemoryRegion *mr;
++    hwaddr offset;
++    uint64_t value = 0;
++
++    if (g->in_reset && g->info->blank_in_reset) {
++        return 0;
++    }
++    if (esp32s3_gate_under(g, addr, &mr, &offset)) {
++        memory_region_dispatch_read(mr, offset, &value, size_memop(size) | MO_LE,
++                                    MEMTXATTRS_UNSPECIFIED);
++    }
++    return value;
++}
++
++static void esp32s3_gate_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
++{
++    Esp32s3PeriphGate *g = opaque;
++    MemoryRegion *mr;
++    hwaddr offset;
++
++    if (!g->in_reset && g->info->unclocked_writes && esp32s3_gate_under(g, addr, &mr, &offset)) {
++        memory_region_dispatch_write(mr, offset, value, size_memop(size) | MO_LE,
++                                     MEMTXATTRS_UNSPECIFIED);
++    }
++}
++
++static const MemoryRegionOps esp32s3_gate_ops = {
++    .read = esp32s3_gate_read,
++    .write = esp32s3_gate_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .impl.min_access_size = 1,
++    .impl.max_access_size = 4,
++};
++
++static void esp32s3_periph_gates_changed(void *opaque)
++{
++    Esp32s3SocState *s = ESP32S3_SOC(opaque);
++
++    for (int i = 0; i < ARRAY_SIZE(s->gates); i++) {
++        Esp32s3PeriphGate *g = &s->gates[i];
++        uint32_t bit = BIT(g->info->bit);
++        bool clocked = s->clock.regs[0x18 / 4 + g->info->reg] & bit;
++
++        g->in_reset = s->clock.regs[0x20 / 4 + g->info->reg] & bit;
++        memory_region_set_enabled(&g->mr, g->in_reset || !clocked);
++    }
++}
++
++static void esp32s3_init_periph_gates(Esp32s3SocState *s, MemoryRegion *sys_mem)
++{
++    for (int i = 0; i < ARRAY_SIZE(s->gates); i++) {
++        Esp32s3PeriphGate *g = &s->gates[i];
++        hwaddr at = 0;
++
++        g->info = &esp32s3_periph_gates[i];
++        while (at < ESP32S3_PERIPH_SIZE && g->under_count < ARRAY_SIZE(g->under)) {
++            MemoryRegionSection found = memory_region_find(sys_mem, g->info->base + at,
++                                                           ESP32S3_PERIPH_SIZE - at);
++            hwaddr start, size;
++
++            if (!found.mr) {
++                break;
++            }
++            start = found.offset_within_address_space - g->info->base;
++            size = int128_get64(found.size);
++            g->under[g->under_count].start = start;
++            g->under[g->under_count].size = size;
++            g->under[g->under_count].mr = found.mr;
++            g->under[g->under_count].offset = found.offset_within_region;
++            g->under_count++;
++            at = start + size;
++        }
++        memory_region_init_io(&g->mr, OBJECT(s), &esp32s3_gate_ops, g, g->info->name,
++                              ESP32S3_PERIPH_SIZE);
++        memory_region_add_subregion_overlap(sys_mem, g->info->base, &g->mr, 10);
++        memory_region_set_enabled(&g->mr, false);
++    }
++    s->clock.periph_gates_changed = esp32s3_periph_gates_changed;
++}
++
++/* Firmware resets a peripheral by raising its bit in SYSTEM_PERIP_RST_EN0 or EN1. */
++static void esp32s3_periph_reset(void *opaque, int reg, uint32_t bits)
++{
++    Esp32s3SocState *s = ESP32S3_SOC(opaque);
++    static const struct {
++        int reg;
++        int bit;
++        hwaddr base;
++    } stored[] = {
++        { 0, 28, DR_REG_APB_SARADC_BASE },
++        { 0, 10, DR_REG_PCNT_BASE },
++        { 0, 8, DR_REG_UHCI0_BASE },
++        { 1, 8, DR_REG_LCD_CAM_BASE },
++    };
++    static const struct {
++        int reg;
++        int bit;
++        int uart;
++    } uarts[] = { { 0, 2, 0 }, { 0, 5, 1 }, { 1, 9, 2 } };
++
++    for (int i = 0; i < ARRAY_SIZE(uarts); i++) {
++        if (uarts[i].reg == reg && (bits & BIT(uarts[i].bit))) {
++            device_cold_reset(DEVICE(&s->uart[uarts[i].uart]));
++        }
++    }
++    if (reg == 1 && (bits & BIT(6))) {
++        device_cold_reset(DEVICE(&s->gdma));
++    }
++
++    for (int i = 0; i < ARRAY_SIZE(stored); i++) {
++        if (stored[i].reg == reg && (bits & BIT(stored[i].bit))) {
++            artemis_socregs_reset_range(&s->socregs, stored[i].base, 0x1000);
++        }
++    }
++    if (reg == 0) {
++        DeviceState *models[32] = {
++            [6] = DEVICE(&s->gpspi[0]),
++            [4] = DEVICE(&s->i2s[0]),
++            [7] = DEVICE(&s->i2c[0]),
++            [9] = DEVICE(&s->rmt),
++            [11] = DEVICE(&s->ledc),
++            [21] = DEVICE(&s->i2s[1]),
++            [16] = DEVICE(&s->gpspi[1]),
++            [18] = DEVICE(&s->i2c[1]),
++        };
++
++        for (int bit = 0; bit < 32; bit++) {
++            if (models[bit] && (bits & BIT(bit))) {
++                device_cold_reset(models[bit]);
++            }
++        }
++    }
++}
++
++/* Runs on the core concerned, so its helpers never see a half-made change. */
++static void esp32s3_apply_cpu_hz(CPUState *cs, run_on_cpu_data data)
++{
++    XtensaCPU *cpu = XTENSA_CPU(cs);
++    CPUXtensaState *env = &cpu->env;
++    const uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    if (clock_get_hz(cpu->clock) == data.host_ulong) {
++        return;
++    }
++
++    /* CCOUNT carries on from where it is, at the new rate. */
++    env->sregs[CCOUNT] = env->ccount_base +
++        (uint32_t)clock_ns_to_ticks(cpu->clock, now - env->time_base);
++    env->ccount_base = env->sregs[CCOUNT];
++    env->time_base = now;
++    env->ccount_time = now;
++    clock_set_hz(cpu->clock, data.host_ulong);
++
++    for (int i = 0; i < env->config->nccompare; i++) {
++        const uint64_t ticks = (uint64_t)(env->sregs[CCOMPARE + i] - env->sregs[CCOUNT] - 1) + 1;
++
++        timer_mod(env->ccompare[i].timer, now + clock_ticks_to_ns(cpu->clock, ticks));
++    }
++}
++
++/*
++ * The cycle counter ticks at the CPU clock, whatever firmware has set that to,
++ * and instructions are paced to take their share of cycles at that clock.
++ */
++static void esp32s3_cpu_hz_changed(void *opaque, uint32_t hz)
++{
++    Esp32s3SocState *s = ESP32S3_SOC(opaque);
++
++    for (int i = 0; i < ESP32S3_CPU_COUNT; i++) {
++        async_run_on_cpu(CPU(&s->cpu[i]), esp32s3_apply_cpu_hz, RUN_ON_CPU_HOST_ULONG(hz));
++    }
++    qatomic_set(&tcg_insn_pace_ps,
++                (uint64_t)s->board.cycles_per_insn_milli * 1000000000ULL / hz);
++}
++
+ static void esp32s3_soc_add_periph_device(MemoryRegion *dest, void* dev, hwaddr dport_base_addr)
+ {
+     MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
+@@ -313,6 +637,148 @@
      }
  }
  
@@ -575,12 +1386,40 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
 +    static const int i2c_irq[] = { ETS_I2C_EXT0_INTR_SOURCE, ETS_I2C_EXT1_INTR_SOURCE };
 +    SysBusDevice *sbd;
 +
++    /* Plain storage, under every model, for the blocks that have none. */
++    sbd = SYS_BUS_DEVICE(&ss->socregs);
++    sysbus_realize(sbd, &error_fatal);
++    memory_region_add_subregion_overlap(sys_mem, ESP32S3_IO_START_ADDR,
++                                        sysbus_mmio_get_region(sbd, 0), -1);
++
 +    /* LEDC */
 +    sbd = SYS_BUS_DEVICE(&ss->ledc);
 +    sysbus_realize(sbd, &error_fatal);
 +    memory_region_add_subregion_overlap(sys_mem, DR_REG_LEDC_BASE,
 +                                        sysbus_mmio_get_region(sbd, 0), 0);
 +    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(intmatrix, ETS_LEDC_INTR_SOURCE));
++
++    /* RMT */
++    sbd = SYS_BUS_DEVICE(&ss->rmt);
++    sysbus_realize(sbd, &error_fatal);
++    memory_region_add_subregion_overlap(sys_mem, DR_REG_RMT_BASE,
++                                        sysbus_mmio_get_region(sbd, 0), 0);
++    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(intmatrix, ETS_RMT_INTR_SOURCE));
++
++    /* I2S */
++    for (int i = 0; i < 2; i++) {
++        static const hwaddr i2s_base[] = { DR_REG_I2S_BASE, DR_REG_I2S1_BASE };
++        static const int i2s_irq[] = { ETS_I2S0_INTR_SOURCE, ETS_I2S1_INTR_SOURCE };
++
++        sbd = SYS_BUS_DEVICE(&ss->i2s[i]);
++        ss->i2s[i].gdma = ESP_GDMA(&ss->gdma);
++        qdev_prop_set_uint32(DEVICE(sbd), "base", i2s_base[i]);
++        qdev_prop_set_uint32(DEVICE(sbd), "gdma-periph", i ? GDMA_I2S1 : GDMA_I2S0);
++        sysbus_realize(sbd, &error_fatal);
++        memory_region_add_subregion_overlap(sys_mem, i2s_base[i],
++                                            sysbus_mmio_get_region(sbd, 0), 0);
++        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(intmatrix, i2s_irq[i]));
++    }
 +
 +    /* GPIO matrix, IO_MUX, RTC_IO */
 +    ss->gpio.ledc = &ss->ledc;
@@ -669,12 +1508,20 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
 +
 +    artemis_board_wire(&ss->board, &ss->gpio, &ss->saradc, ARTEMIS_ST7735S(panel),
 +                       ARTEMIS_LSM6DS3TRC(imu), ARTEMIS_BM8563(rtc));
++
++    /* Both cores exist by now, so the clock block can start telling them their rate. */
++    tcg_insn_pacing = ss->board.cycles_per_insn_milli != 0;
++    ss->clock.cpu_hz_changed = esp32s3_cpu_hz_changed;
++    ss->clock.cpu_hz_opaque = ss;
++    ss->clock.periph_reset = esp32s3_periph_reset;
++    ss->clock.periph_reset_opaque = ss;
++    esp32s3_init_periph_gates(ss, sys_mem);
 +}
 +
  struct Esp32s3MachineState {
      MachineState parent;
  
-@@ -410,6 +588,8 @@
+@@ -410,6 +876,8 @@
                                  qdev_get_gpio_in_named(dev, ESP32S3_RTC_DIG_RESET_GPIO, 0));
      qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32S3_RTC_CLK_UPDATE_GPIO, 0,
                                  qdev_get_gpio_in_named(dev, ESP32S3_RTC_CLK_UPDATE_GPIO, 0));
@@ -683,7 +1530,27 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      for (int i = 0; i < ms->smp.cpus; ++i) {
          qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32S3_RTC_CPU_RESET_GPIO, i,
                                      qdev_get_gpio_in_named(dev, ESP32S3_RTC_CPU_RESET_GPIO, i));
-@@ -545,6 +725,9 @@
+@@ -430,19 +898,6 @@
+     sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdmmc), 0,
+                        qdev_get_gpio_in(intmatrix_dev, ETS_SDIO_HOST_INTR_SOURCE));
+ 
+-    /* Emulation of APB_CTRL_DATE_REG, needed for ECO3 revision detection.
+-     * This is a small hack to avoid creating a whole new device just to emulate one
+-     * register.
+-     */
+-    const hwaddr apb_ctrl_regs = DR_REG_APB_CTRL_BASE;
+-    MemoryRegion *apbctrl_mem = g_new(MemoryRegion, 1);
+-    memory_region_init_ram(apbctrl_mem, NULL, "esp32s3.apbctrl", 0x400 /* bytes */, &error_fatal);
+-    memory_region_add_subregion(sys_mem, apb_ctrl_regs, apbctrl_mem);
+-    uint32_t apb_ctrl_date_reg_val = 0x16042000 | 0x80000000;  /* MSB indicates ECO3 silicon revision */
+-    uint32_t qemu_sig = RGB_QEMU_ORIGIN;
+-    cpu_physical_memory_write(apb_ctrl_regs + 0x7c, &apb_ctrl_date_reg_val, 4);
+-    cpu_physical_memory_write(apb_ctrl_regs + RGB_QEMU_ORIGIN_REG, &qemu_sig, 4);
+-
+     qemu_register_reset((QEMUResetHandler*) esp32s3_soc_reset, dev);
+ 
+     /* TWAI realization */
+@@ -545,6 +1000,9 @@
  
      qdev_init_gpio_in_named(DEVICE(s), esp32s3_dig_reset,  ESP32S3_RTC_DIG_RESET_GPIO, 1);
      qdev_init_gpio_in_named(DEVICE(s), esp32s3_cpu_reset,  ESP32S3_RTC_CPU_RESET_GPIO, ESP32S3_CPU_COUNT);
@@ -693,7 +1560,22 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      qdev_init_gpio_in_named(DEVICE(s), esp32s3_cpu_stall,  ESP32S3_RTC_CPU_STALL_GPIO, ESP32S3_CPU_COUNT);
      qdev_init_gpio_in_named(DEVICE(s), esp32s3_clk_update, ESP32S3_RTC_CLK_UPDATE_GPIO, 1);
  
-@@ -625,9 +808,10 @@
+@@ -592,14 +1050,6 @@
+ 
+ // -----------------------------------------------
+ 
+-static void esp32s3_soc_add_unimp_device(MemoryRegion *dest, const char* name, hwaddr dport_base_addr, size_t size)
+-{
+-    create_unimplemented_device(name, dport_base_addr, size);
+-    char * name_apb = g_strdup_printf("%s-apb", name);
+-    create_unimplemented_device(name_apb, dport_base_addr + APB_REG_BASE, size);
+-    g_free(name_apb);
+-}
+-
+ static void esp32s3_machine_init(MachineState *machine)
+ {
+     DriveInfo *dinfo = drive_get(IF_MTD, 0, 0);
+@@ -625,9 +1075,10 @@
      memory_region_add_subregion(sys_mem, memmap[ESP32S3_MEMREGION_DRAM].base, dram);
  
  
@@ -706,7 +1588,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
  
      // qdev_prop_set_chr(DEVICE(ss), "serial0", serial_hd(0));
      // qdev_prop_set_chr(DEVICE(ss), "serial1", serial_hd(1));
-@@ -638,8 +822,15 @@
+@@ -638,8 +1089,19 @@
      object_initialize_child(OBJECT(ss), "extmem", &ss->cache, TYPE_ESP32S3_CACHE);
      object_initialize_child(OBJECT(ss), "spi1", &ss->spi1, TYPE_ESP32S3_SPI);
      object_initialize_child(OBJECT(ss), "efuse", &ss->efuse, TYPE_ESP32S3_EFUSE);
@@ -714,17 +1596,21 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
 -    object_initialize_child(OBJECT(ss), "gpio", &ss->gpio, TYPE_ESP32S3_GPIO);
 +    object_initialize_child(OBJECT(ss), "gpio", &ss->gpio, TYPE_ARTEMIS_GPIO);
 +    object_initialize_child(OBJECT(ss), "ledc", &ss->ledc, TYPE_ARTEMIS_LEDC);
++    object_initialize_child(OBJECT(ss), "rmt", &ss->rmt, TYPE_ARTEMIS_RMT);
++    object_initialize_child(OBJECT(ss), "i2s0", &ss->i2s[0], TYPE_ARTEMIS_I2S);
++    object_initialize_child(OBJECT(ss), "i2s1", &ss->i2s[1], TYPE_ARTEMIS_I2S);
 +    object_initialize_child(OBJECT(ss), "gpspi2", &ss->gpspi[0], TYPE_ARTEMIS_GPSPI);
 +    object_initialize_child(OBJECT(ss), "gpspi3", &ss->gpspi[1], TYPE_ARTEMIS_GPSPI);
 +    object_initialize_child(OBJECT(ss), "i2c0", &ss->i2c[0], TYPE_ARTEMIS_I2C);
 +    object_initialize_child(OBJECT(ss), "i2c1", &ss->i2c[1], TYPE_ARTEMIS_I2C);
 +    object_initialize_child(OBJECT(ss), "usj", &ss->usj, TYPE_ARTEMIS_USJ);
++    object_initialize_child(OBJECT(ss), "socregs", &ss->socregs, TYPE_ARTEMIS_SOCREGS);
 +    object_initialize_child(OBJECT(ss), "saradc", &ss->saradc, TYPE_ARTEMIS_SARADC);
 +    object_initialize_child(OBJECT(ss), "board", &ss->board, TYPE_ARTEMIS_BOARD);
      object_initialize_child(OBJECT(ss), "rng", &ss->rng, TYPE_ESP32S3_RNG);
  
      object_initialize_child(OBJECT(ss), "clock", &ss->clock, TYPE_ESP32S3_CLOCK);
-@@ -668,13 +859,6 @@
+@@ -668,13 +1130,6 @@
      /* Initialize OpenCores Ethernet controller now sicne it requires the interrupt matrix */
      esp32s3_init_openeth(ss);
  
@@ -738,7 +1624,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      /* SPI1 controller (SPI Flash) */
      {
          ss->spi1.xts_aes = &ss->xts_aes;
-@@ -740,6 +924,8 @@
+@@ -740,6 +1195,8 @@
          /* Connect the Watchdog interrupt line to the interrupt matrix */
          qdev_connect_gpio_out_named(DEVICE(&ss->timg[0]), ESP32S3_WDT_IRQ_INTERRUPT, 0,
                                      qdev_get_gpio_in(intmatrix_dev, ETS_TG0_WDT_LEVEL_INTR_SOURCE));
@@ -747,7 +1633,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      }
      {
          sysbus_realize(SYS_BUS_DEVICE(&ss->timg[1]), &error_fatal);
-@@ -754,6 +940,8 @@
+@@ -754,6 +1211,8 @@
          /* Connect the Watchdog interrupt line to the interrupt matrix */
          qdev_connect_gpio_out_named(DEVICE(&ss->timg[1]), ESP32S3_WDT_IRQ_INTERRUPT, 0,
                                      qdev_get_gpio_in(intmatrix_dev, ETS_TG1_WDT_LEVEL_INTR_SOURCE));
@@ -756,7 +1642,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      }
  
      /* System timer */
-@@ -768,13 +956,6 @@
+@@ -768,13 +1227,6 @@
      }
  
  
@@ -770,7 +1656,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      {
          qdev_realize(DEVICE(&ss->rng), &ss->periph_bus, &error_fatal);
          esp32s3_soc_add_periph_device(sys_mem, &ss->rng, ESP32S3_RNG_BASE);
-@@ -784,7 +965,8 @@
+@@ -784,7 +1236,8 @@
  
      /* GDMA Realization */
      {
@@ -780,12 +1666,12 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
          sysbus_realize(SYS_BUS_DEVICE(&ss->gdma), &error_fatal);
          MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->gdma), 0);
          memory_region_add_subregion_overlap(sys_mem, DR_REG_GDMA_BASE, mr, 0);
-@@ -870,7 +1052,8 @@
+@@ -869,8 +1322,7 @@
+         memory_region_add_subregion_overlap(sys_mem, esp32s3_memmap[ESP32S3_MEMREGION_FRAMEBUF].base, &ss->rgb.vram, 0);
      }
  
-     esp32s3_soc_add_unimp_device(sys_mem, "esp32s3.rmt", DR_REG_RMT_BASE, 0x1000);
+-    esp32s3_soc_add_unimp_device(sys_mem, "esp32s3.rmt", DR_REG_RMT_BASE, 0x1000);
 -    esp32s3_soc_add_unimp_device(sys_mem, "esp32s3.iomux", DR_REG_IO_MUX_BASE, 0x2000);
-+
 +    esp32s3_artemis_init(ss, sys_mem, intmatrix_dev);
  
      
@@ -793,33 +1679,178 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
 diff -ruN a/hw/xtensa/esp32s3_clk.c b/hw/xtensa/esp32s3_clk.c
 --- a/hw/xtensa/esp32s3_clk.c
 +++ b/hw/xtensa/esp32s3_clk.c
-@@ -88,6 +88,13 @@
+@@ -23,6 +23,69 @@
+ #define CLOCK_DEBUG      0
+ #define CLOCK_WARNING    0
+ 
++#define SYSTEM_PERIP_CLK_EN0_OFFSET  0x018
++#define SYSTEM_PERIP_RST_EN0_OFFSET  0x020
++#define SYSTEM_PERIP_RST_EN1_OFFSET  0x024
++#define SYSTEM_DATE_OFFSET  0xFFC
++#define SYSTEM_DATE_VALUE   0x02101220
++
++/* Reset value and writable bits of each register, from the chip's register description. */
++static const struct {
++    uint32_t reset;
++    uint32_t writable;
++} system_reg_info[ESP32S3_SYSTEM_REG_WORDS] = {
++    [0x000 / 4] = { 0x00000004, 0x00000007 }, /* CORE_1_CONTROL_0 */
++    [0x008 / 4] = { 0x00000000, 0x000000c0 }, /* CPU_PERI_CLK_EN */
++    [0x00c / 4] = { 0x000000c0, 0x000000c0 }, /* CPU_PERI_RST_EN */
++    [0x014 / 4] = { 0x00000001, 0x00000001 }, /* MEM_PD_MASK */
++    [0x018 / 4] = { 0xf9c1e06f, 0xffffffff }, /* PERIP_CLK_EN0 */
++    [0x01c / 4] = { 0x00000600, 0x000007ff }, /* PERIP_CLK_EN1 */
++    [0x020 / 4] = { 0x00000000, 0xffffffff }, /* PERIP_RST_EN0 */
++    [0x024 / 4] = { 0x000001fe, 0x000007ff }, /* PERIP_RST_EN1 */
++    [0x028 / 4] = { 0x000000ff, 0x00000fff }, /* BT_LPCK_DIV_INT */
++    [0x02c / 4] = { 0x02001001, 0x1fffffff }, /* BT_LPCK_DIV_FRAC */
++    [0x040 / 4] = { 0x00000001, 0x00000007 }, /* RSA_PD_CTRL */
++    [0x044 / 4] = { 0x00000001, 0x00000003 }, /* EDMA_CTRL */
++    [0x048 / 4] = { 0x00000005, 0x0000000f }, /* CACHE_CONTROL */
++    [0x050 / 4] = { 0x7ff00000, 0x7fffff00 }, /* RTC_FASTMEM_CONFIG */
++    [0x054 / 4] = { 0xffffffff, 0x00000000 }, /* RTC_FASTMEM_CRC */
++    [0x058 / 4] = { 0x00000000, 0x00000001 }, /* REDUNDANT_ECO_CTRL */
++    [0x05c / 4] = { 0x00000001, 0x00000001 }, /* CLOCK_GATE */
++    [0x064 / 4] = { 0x00000003, 0x00c0003f }, /* MEM_PVT */
++    [0x068 / 4] = { 0x00000003, 0x0000007f }, /* COMB_PVT_LVT_CONF */
++    [0x06c / 4] = { 0x00000003, 0x0000007f }, /* COMB_PVT_NVT_CONF */
++    [0x070 / 4] = { 0x00000003, 0x0000007f }, /* COMB_PVT_HVT_CONF */
++};
++
++/* The frequency the registers select for the CPU clock. */
++static uint32_t esp32s3_clock_cpu_hz(ESP32S3ClockState *s)
++{
++    const uint32_t divider = FIELD_EX32(s->sysclk, SYSTEM_SYSCLK_CONF, PRE_DIV_CNT) + 1;
++
++    switch (FIELD_EX32(s->sysclk, SYSTEM_SYSCLK_CONF, SOC_CLK_SEL)) {
++        case ESP32S3_CLK_SEL_XTAL:
++            return 40000000 / divider;
++        case ESP32S3_CLK_SEL_RCFAST:
++            return 17500000 / divider;
++        default:
++            switch (FIELD_EX32(s->cpuperconf, SYSTEM_CPU_PER_CONF, CPUPERIOD_SEL)) {
++                case 0:
++                    return 80000000;
++                case 1:
++                    return 160000000;
++                default:
++                    return 240000000;
++            }
++    }
++}
++
++static void esp32s3_clock_cpu_hz_changed(ESP32S3ClockState *s)
++{
++    if (s->cpu_hz_changed) {
++        s->cpu_hz_changed(s->cpu_hz_opaque, esp32s3_clock_cpu_hz(s));
++    }
++}
++
+ static uint32_t esp32s3_read_cpu_intr(ESP32S3ClockState *s, uint32_t index)
+ {
+     return (s->levels >> index) & 1;
+@@ -70,10 +133,13 @@
+         case A_SYSTEM_EXTERNAL_DEVICE_ENCRYPT_DECRYPT_CONTROL:
+             r = s->sys_ext_dev_enc_dec_ctrl;
+             break;
++        case SYSTEM_DATE_OFFSET:
++            r = SYSTEM_DATE_VALUE;
++            break;
+         default:
+-#if CLOCK_WARNING
+-            warn_report("[CLOCK] Unsupported read from %08lx\n", addr);
+-#endif
++            if (addr / 4 < ESP32S3_SYSTEM_REG_WORDS) {
++                r = s->regs[addr / 4];
++            }
+             break;
+     }
+     return r;
+@@ -88,6 +154,15 @@
          case A_SYSTEM_CORE_1_CONTROL_1_REG:
                  s->app_cpu_addr = (uint32_t)value;
              break;
 +        case A_SYSTEM_CPU_PER_CONF:
 +            s->cpuperconf = value;
++            esp32s3_clock_cpu_hz_changed(s);
 +            break;
 +        case A_SYSTEM_SYSCLK_CONF:
 +            /* The clock source and divider; the crystal frequency above is read-only. */
 +            s->sysclk = (s->sysclk & ~0xFFF) | (value & 0xFFF);
++            esp32s3_clock_cpu_hz_changed(s);
 +            break;
          case A_SYSTEM_CPU_INTR_FROM_CPU_0:
          case A_SYSTEM_CPU_INTR_FROM_CPU_1:
          case A_SYSTEM_CPU_INTR_FROM_CPU_2:
-@@ -122,7 +129,7 @@
+@@ -98,9 +173,24 @@
+             s->sys_ext_dev_enc_dec_ctrl = value;
+             break;
+         default:
+-#if CLOCK_WARNING
+-            warn_report("[CLOCK] Unsupported write to %08lx (%08lx)\n", addr, value);
+-#endif
++            if (addr / 4 < ESP32S3_SYSTEM_REG_WORDS) {
++                const uint32_t writable = system_reg_info[addr / 4].writable;
++                const uint32_t before = s->regs[addr / 4];
++
++                s->regs[addr / 4] = (before & ~writable) | (value & writable);
++
++                /* A reset bit going up puts that peripheral back in its reset state */
++                const bool resets = addr == SYSTEM_PERIP_RST_EN0_OFFSET ||
++                                    addr == SYSTEM_PERIP_RST_EN1_OFFSET;
++                if (resets && s->periph_reset && (s->regs[addr / 4] & ~before)) {
++                    s->periph_reset(s->periph_reset_opaque, addr == SYSTEM_PERIP_RST_EN1_OFFSET,
++                                    s->regs[addr / 4] & ~before);
++                }
++                if (addr >= SYSTEM_PERIP_CLK_EN0_OFFSET && addr <= SYSTEM_PERIP_RST_EN1_OFFSET &&
++                    s->periph_gates_changed && s->regs[addr / 4] != before) {
++                    s->periph_gates_changed(s->periph_reset_opaque);
++                }
++            }
+             break;
+     }
+ }
+@@ -122,7 +212,15 @@
  
      /* Divider for PLL clock and APB  frequency */
      s->cpuperconf = (ESP32S3_PERIOD_SEL_80 << R_SYSTEM_CPU_PER_CONF_CPUPERIOD_SEL_SHIFT) |
 -                    (ESP32S3_FREQ_SEL_PLL_480 << R_SYSTEM_CPU_PER_CONF_PLL_FREQ_SEL_SHIFT);
 +                    (1 << R_SYSTEM_CPU_PER_CONF_PLL_FREQ_SEL_SHIFT);
++
++    for (int i = 0; i < ESP32S3_SYSTEM_REG_WORDS; i++) {
++        s->regs[i] = system_reg_info[i].reset;
++    }
++    esp32s3_clock_cpu_hz_changed(s);
++    if (s->periph_gates_changed) {
++        s->periph_gates_changed(s->periph_reset_opaque);
++    }
  
      /* Initialize the IRQs */
      s->levels = 0;
+@@ -143,7 +241,7 @@
+     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+ 
+     memory_region_init_io(&s->iomem, obj, &esp32s3_clock_ops, s,
+-                          TYPE_ESP32S3_CLOCK, A_SYSTEM_COMB_PVT_ERR_HVT_SITE3 + sizeof(uint32_t));
++                          TYPE_ESP32S3_CLOCK, SYSTEM_DATE_OFFSET + sizeof(uint32_t));
+     sysbus_init_mmio(sbd, &s->iomem);
+ 
+     /* Initialize the output IRQ lines used to manually trigger interrupts */
 diff -ruN a/hw/xtensa/esp32s3_intc.c b/hw/xtensa/esp32s3_intc.c
 --- a/hw/xtensa/esp32s3_intc.c
 +++ b/hw/xtensa/esp32s3_intc.c
-@@ -26,20 +26,34 @@
+@@ -21,25 +21,45 @@
+ 
+ #define INTMATRIX_UNINT_VALUE   6
+ 
++/* After each core's map come four status words and a clock gate. */
++#define INTMATRIX_SOURCES       99
++#define INTMATRIX_STATUS_BASE   0x18C
++#define INTMATRIX_CLOCK_GATE    0x19C
++#define INTMATRIX_CORE_SIZE     0x800
++
+ #define INTC_DEBUG      0
+ #define INTC_WARNING    0
  
  #define IRQ_MAP(cpu, input) s->irq_map[cpu][input]
  
@@ -864,8 +1895,42 @@ diff -ruN a/hw/xtensa/esp32s3_intc.c b/hw/xtensa/esp32s3_intc.c
      }
  }
  
-@@ -72,7 +86,14 @@
+@@ -60,6 +80,21 @@
+ static uint64_t esp32s3_intmatrix_read(void* opaque, hwaddr addr, unsigned int size)
+ {
      Esp32s3IntMatrixState *s = ESP32S3_INTMATRIX(opaque);
++    const hwaddr reg = addr % INTMATRIX_CORE_SIZE;
++
++    if (reg >= INTMATRIX_STATUS_BASE && reg < INTMATRIX_CLOCK_GATE) {
++        const int first = (reg - INTMATRIX_STATUS_BASE) / sizeof(uint32_t) * 32;
++        uint32_t pending = 0;
++
++        for (int i = 0; i < 32 && first + i < INTMATRIX_SOURCES; i++) {
++            pending |= (uint32_t)(s->levels[first + i] != 0) << i;
++        }
++        return pending;
++    }
++    if (reg == INTMATRIX_CLOCK_GATE) {
++        return s->clock_gate;
++    }
++
+     uint8_t* map_entry = get_map_entry(s, addr);
+     return (map_entry != NULL) ? *map_entry : 0;
+ }
+@@ -70,9 +105,26 @@
+     info_report("\x1b[31m[INTC] esp32s3_intmatrix_write  addr = %ld, value=%ld\x1b[0m", addr, value);
+ #endif // INTC_DEBUG
+     Esp32s3IntMatrixState *s = ESP32S3_INTMATRIX(opaque);
++    const hwaddr reg = addr % INTMATRIX_CORE_SIZE;
++
++    if (reg >= INTMATRIX_STATUS_BASE && reg < INTMATRIX_CLOCK_GATE) {
++        return;
++    }
++    if (reg == INTMATRIX_CLOCK_GATE) {
++        s->clock_gate = value & 1;
++        return;
++    }
++
      uint8_t* map_entry = get_map_entry(s, addr);
      if (map_entry != NULL) {
 +        const uint8_t old_index = *map_entry;
@@ -879,6 +1944,86 @@ diff -ruN a/hw/xtensa/esp32s3_intc.c b/hw/xtensa/esp32s3_intc.c
      }
  }
  
+@@ -86,6 +138,7 @@
+ {
+     Esp32s3IntMatrixState *s = ESP32S3_INTMATRIX(obj);
+     memset(s->irq_map, INTMATRIX_UNINT_VALUE, sizeof(s->irq_map));
++    s->clock_gate = 1;
+     for (int i = 0; i < ESP32S3_CPU_COUNT; ++i) {
+         if (s->outputs[i] == NULL) {
+             continue;
+diff -ruN a/include/hw/core/cpu.h b/include/hw/core/cpu.h
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -366,8 +366,21 @@
+ #endif
+     IcountDecr icount_decr;
+     bool can_do_io;
++    /* Instructions this CPU may still run before it's checked against its pace. */
++    int32_t insn_budget;
+ } CPUNegativeOffsetState;
+ 
++/*
++ * Instruction pacing: a CPU that executes faster than the given time per
++ * instruction waits for the clock to catch up, in slices short enough not to
++ * show in interrupt latency. It leaves idle time alone and never makes up for
++ * a host that is too slow.
++ */
++/* Whether translated code keeps count; fixed before the first translation. */
++extern bool tcg_insn_pacing;
++/* Picoseconds each instruction should take; 0 lets the CPUs run freely. */
++extern uint32_t tcg_insn_pace_ps;
++
+ struct KVMState;
+ struct kvm_run;
+ 
+@@ -493,6 +506,9 @@
+     uint32_t interrupt_request;
+     int singlestep_enabled;
+     int64_t icount_budget;
++    /* Host time by which the instructions run so far should have finished. */
++    int64_t insn_pace_due;
++    bool insn_pace_started;
+     int64_t icount_extra;
+     uint64_t random_seed;
+     sigjmp_buf jmp_env;
+diff -ruN a/include/hw/dma/esp_gdma.h b/include/hw/dma/esp_gdma.h
+--- a/include/hw/dma/esp_gdma.h
++++ b/include/hw/dma/esp_gdma.h
+@@ -109,6 +109,9 @@
+     uint32_t peripheral;
+     /* Interrupt related registers */
+     DmaIntState int_state;
++    /* For a peripheral that streams: the descriptor in hand and the one after it */
++    uint32_t stream_desc;
++    uint32_t stream_next;
+ } DmaConfigState;
+ 
+ 
+@@ -158,6 +161,23 @@
+ bool esp_gdma_read_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint32_t size);
+ bool esp_gdma_write_channel(ESPGdmaState *s, uint32_t chan, uint8_t* buffer, uint32_t size);
+ 
++/**
++ * @brief For a peripheral that moves data at its own pace (I2S): one descriptor's
++ *        buffer per call, carrying on from where the last call stopped, or from the
++ *        link address when the channel has been started since.
++ *
++ * `esp_gdma_stream_out` copies the next OUT buffer and returns its length, or -1 when
++ * there is none. Firmware hears nothing until `esp_gdma_stream_out_done` says that
++ * buffer has gone out.
++ *
++ * `esp_gdma_stream_in_room` returns the size of the next IN buffer, or -1 when there is
++ * none, and `esp_gdma_stream_in` fills it and hands it to firmware.
++ */
++int esp_gdma_stream_out(ESPGdmaState *s, uint32_t chan, uint8_t *buffer, uint32_t size);
++void esp_gdma_stream_out_done(ESPGdmaState *s, uint32_t chan);
++int esp_gdma_stream_in_room(ESPGdmaState *s, uint32_t chan);
++void esp_gdma_stream_in(ESPGdmaState *s, uint32_t chan, const uint8_t *buffer, uint32_t size);
++
+ 
+ /**
+  * @brief Function only meant to be used by inherited classes
 diff -ruN a/include/hw/misc/esp32s3_rtc_cntl.h b/include/hw/misc/esp32s3_rtc_cntl.h
 --- a/include/hw/misc/esp32s3_rtc_cntl.h
 +++ b/include/hw/misc/esp32s3_rtc_cntl.h
@@ -938,6 +2083,15 @@ diff -ruN a/include/hw/timer/esp_systimer.h b/include/hw/timer/esp_systimer.h
  } ESPSysTimerCounter;
  
  
+@@ -98,6 +99,8 @@
+     /* The easiest way to implement timeout is by using one timer per comparator */
+     QEMUTimer qtimer;
+     uint64_t expire_time;
++    /* In period mode, the count of the next match. */
++    uint64_t target;
+     qemu_irq irq;
+     int cur_irq_level;
+     /* Pointer to the owner */
 diff -ruN a/include/hw/timer/esp_timg.h b/include/hw/timer/esp_timg.h
 --- a/include/hw/timer/esp_timg.h
 +++ b/include/hw/timer/esp_timg.h
@@ -965,14 +2119,47 @@ diff -ruN a/include/hw/timer/esp_timg.h b/include/hw/timer/esp_timg.h
  
  typedef struct ESPTimgClass {
      SysBusDeviceClass parent_class;
+diff -ruN a/include/hw/xtensa/esp32s3_clk.h b/include/hw/xtensa/esp32s3_clk.h
+--- a/include/hw/xtensa/esp32s3_clk.h
++++ b/include/hw/xtensa/esp32s3_clk.h
+@@ -40,6 +40,8 @@
+ #define ESP32S3_PERIOD_SEL_80       0
+ #define ESP32S3_PERIOD_SEL_160      1
+ 
++/* SYSTEM registers up to the last PVT monitor, by offset / 4. */
++#define ESP32S3_SYSTEM_REG_WORDS    (0xA4 / 4)
+ 
+ typedef struct ESP32S3ClockState {
+     SysBusDevice parent_obj;
+@@ -59,6 +61,19 @@
+     uint32_t app_cpu_addr;
+     
+     uint32_t sys_ext_dev_enc_dec_ctrl;
++
++    /* Registers that only hold what was written to them. */
++    uint32_t regs[ESP32S3_SYSTEM_REG_WORDS];
++
++    /* Told whenever the registers select another CPU clock frequency. */
++    void (*cpu_hz_changed)(void *opaque, uint32_t hz);
++    void *cpu_hz_opaque;
++
++    /* Told which bits of SYSTEM_PERIP_RST_EN0 (or EN1) firmware has just set. */
++    void (*periph_reset)(void *opaque, int reg, uint32_t bits);
++    /* Told whenever the peripheral clock enables or resets have changed. */
++    void (*periph_gates_changed)(void *opaque);
++    void *periph_reset_opaque;
+ } ESP32S3ClockState;
+ 
+ typedef struct ESP32S3ClockClass {
 diff -ruN a/include/hw/xtensa/esp32s3_intc.h b/include/hw/xtensa/esp32s3_intc.h
 --- a/include/hw/xtensa/esp32s3_intc.h
 +++ b/include/hw/xtensa/esp32s3_intc.h
-@@ -142,6 +142,7 @@
+@@ -142,6 +142,8 @@
      MemoryRegion iomem;
      qemu_irq *outputs[ESP32S3_CPU_COUNT];
      uint8_t irq_map[ESP32S3_CPU_COUNT][ESP32S3_INT_MATRIX_INPUTS];
 +    uint8_t levels[ESP32S3_INT_MATRIX_INPUTS];
++    uint32_t clock_gate;
  
      /* properties */
      XtensaCPU *cpu[ESP32S3_CPU_COUNT];

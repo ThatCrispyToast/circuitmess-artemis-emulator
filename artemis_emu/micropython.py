@@ -1,14 +1,20 @@
-"""Runs Python on the watch over the serial REPL, the way mpremote and CircuitBlocks do."""
+"""Runs Python on a watch, emulated or real, over the serial REPL as mpremote does."""
 
 from __future__ import annotations
 
 import time
 from typing import Callable, Optional
 
-from .machine import EmulatorError, Watch
+from .machine import EmulatorError
 
 _RAW_PROMPT = b"raw REPL; CTRL-B to exit\r\n>"
 _BOOT_BANNER = b"ESP-ROM:"
+# What MicroPython prints once it's reading its input, and how long that takes at
+# the outside when it prints nothing, as when main.py runs straight away.
+_UP_SIGNS = (b"MicroPython v", b">>> ", b"Performing initial setup")
+_BOOT_TIME = 1.0
+# Asks the raw REPL for raw-paste mode, where the watch paces what it's sent.
+_RAW_PASTE = b"\x05A\x01"
 
 
 class PythonError(Exception):
@@ -24,9 +30,12 @@ class WatchRestarted(Exception):
 
 
 class PythonSession:
-    """Talks to MicroPython's raw REPL on the watch's USB serial port."""
+    """
+    Talks to MicroPython's raw REPL on the watch's USB serial port. The watch is an
+    emulated `Watch` or a real one, a `Device`.
+    """
 
-    def __init__(self, watch: Watch, boot_timeout: float = 60.0):
+    def __init__(self, watch, boot_timeout: float = 60.0):
         self.watch = watch
         self.port = watch.usb_port
         self._mark = 0
@@ -46,13 +55,41 @@ class PythonSession:
         self._mark = end + len(token)
         return data
 
+    def _read(self, count: int, timeout: float) -> bytes:
+        """Takes the next bytes after the read mark."""
+        end = self._mark + count
+        if not self.port.wait_for(lambda buf: len(buf) >= end, timeout) or len(self.port.buffer) < end:
+            tail = bytes(self.port.buffer[self._mark:])[-200:]
+            raise TimeoutError(f"the watch stopped answering; last output: {tail!r}")
+        data = bytes(self.port.buffer[self._mark : end])
+        self._mark = end
+        return data
+
     def _write(self, data: bytes) -> None:
         try:
             self.port.write(data)
         except OSError:
-            raise EmulatorError(f"the emulator stopped: {self.watch.emulator_log()}") from None
+            raise EmulatorError(f"the watch is gone: {self.watch.emulator_log()}") from None
+
+    def _wait_until_listening(self) -> None:
+        """
+        After a restart, holds off until MicroPython is up. On the watch, bytes that
+        arrive before it starts reading its USB port are never read, and stop
+        everything sent after them from getting through.
+        """
+        deadline = time.monotonic() + _BOOT_TIME
+        while time.monotonic() < deadline:
+            buffer = self.port.buffer
+            boot = buffer.rfind(_BOOT_BANNER)
+            recently = time.monotonic() - self.watch.restarted_at < _BOOT_TIME
+            if boot < 0 and not recently:
+                return  # it has been running all along
+            if any(buffer.find(sign, max(boot, 0)) >= 0 for sign in _UP_SIGNS):
+                return
+            time.sleep(0.01)
 
     def _enter_raw(self, timeout: float) -> None:
+        self._wait_until_listening()
         deadline = time.monotonic() + timeout
         while True:
             self._mark = len(self.port.buffer)
@@ -71,14 +108,50 @@ class PythonSession:
 
     def start(self, code: str) -> None:
         """Starts code without waiting for it, to interact with it or if it restarts the watch."""
-        self._mark = len(self.port.buffer)
         data = code.encode()
-        for i in range(0, len(data), 256):
-            self._write(data[i : i + 256])
-            time.sleep(0.001)
-        self._write(b"\x04")
-        self._wait(b"OK", 10.0)
+        self._mark = len(self.port.buffer)
+        self._write(_RAW_PASTE)
+        try:
+            answer = self._read(2, 2.0)
+        except TimeoutError:
+            answer = b""
+
+        if answer == b"R\x01":
+            self._paste(data)
+        else:
+            # A MicroPython without raw-paste mode: start over and send it all at once,
+            # which is fine for as much as its input buffer holds.
+            if answer != b"R\x00":
+                self._enter_raw(5.0)
+            self._mark = len(self.port.buffer)
+            for i in range(0, len(data), 256):
+                self._write(data[i : i + 256])
+                time.sleep(0.001)
+            self._write(b"\x04")
+            self._wait(b"OK", 10.0)
         self._started = self._mark
+
+    def _paste(self, data: bytes) -> None:
+        """Sends code in raw-paste mode: no more at a time than the watch has asked for."""
+        window = int.from_bytes(self._read(2, 5.0), "little")
+        credit = window
+        sent = 0
+        while sent < len(data):
+            # \x01 grants another window; \x04 means the watch has given up on the input.
+            while credit == 0 or len(self.port.buffer) > self._mark:
+                flow = self._read(1, 10.0)
+                if flow == b"\x01":
+                    credit += window
+                elif flow == b"\x04":
+                    self._write(b"\x04")
+                    return
+            chunk = data[sent : sent + credit]
+            self._write(chunk)
+            sent += len(chunk)
+            credit -= len(chunk)
+        self._write(b"\x04")
+        while self._read(1, 10.0) != b"\x04":
+            pass
 
     def run(
         self,

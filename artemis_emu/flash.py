@@ -60,6 +60,27 @@ def _from_app_image(app: bytes, base_image: bytes | None) -> bytes:
     return bytes(image)
 
 
+def flash_plan(source: str | Path) -> list[tuple[int, Path]]:
+    """What to write where to put a build on a real watch: (offset, file) pairs."""
+    path = Path(source)
+
+    if path.is_dir():
+        for build_dir in (path, path / "build"):
+            if (build_dir / "flasher_args.json").exists():
+                args = json.loads((build_dir / "flasher_args.json").read_text())
+                return [(int(offset, 16), build_dir / name)
+                        for offset, name in sorted(args["flash_files"].items())]
+        raise FirmwareError(f"{path} has no flasher_args.json: not an ESP-IDF build directory")
+
+    data = path.read_bytes()
+    if not data or data[0] != ESP_IMAGE_MAGIC:
+        raise FirmwareError(f"{path} isn't an ESP32 firmware image")
+    if len(data) > FLASH_SIZE:
+        raise FirmwareError(f"{path} is larger than the watch's {FLASH_SIZE} bytes of flash")
+    # A bare application goes where the partition table expects it.
+    return [(0 if _has_partition_table(data) else APP_OFFSET, path)]
+
+
 def build_flash_image(source: str | Path, base_image_path: str | Path | None = None) -> bytes:
     """Accepts a merged flash image, a bare app image, or an ESP-IDF build directory."""
     path = Path(source)

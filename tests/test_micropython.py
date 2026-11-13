@@ -44,9 +44,11 @@ def test_session_survives_an_exception(micropython):
     assert micropython.run("print('still here')").strip() == "still here"
 
 
-def test_is_the_circuitmess_build_for_this_board(micropython):
-    assert evaluate(micropython, "__import__('os').uname().machine") == "Artemis watch with ESP32S3"
+def test_is_the_circuitmess_build_for_their_s3_devices(micropython):
+    machine = evaluate(micropython, "__import__('os').uname().machine")
+    assert machine == "CircuitMess ESP32S3 Devices with ESP32S3"
     assert evaluate(micropython, "__import__('efuse').read_rev()") == 3
+    assert evaluate(micropython, "__import__('efuse').read_pid()") == 3
 
 
 def test_a_big_script_survives_the_serial_link(micropython):
@@ -278,9 +280,11 @@ def test_led_brightness_follows_pwm(micropython):
 
 
 def test_rgb_led_mixes_channels(micropython):
+    watch = micropython.watch
     micropython.run(SETUP + "Artemis.rgb.set(100, 50, 0)")
-    r, g, b = micropython.watch.rgb_led
-    assert r > 0.99
+    # A new duty takes effect at the end of the PWM period, a millisecond here.
+    watch.wait_until(lambda: watch.rgb_led[0] > 0.99, timeout=1)
+    r, g, b = watch.rgb_led
     # The driver squares brightness for a linear response to the eye.
     assert g == pytest.approx(0.25, abs=0.02)
     assert b < 0.01
@@ -741,4 +745,9 @@ def test_runs_with_a_set_clock_and_supply():
         assert evaluate(session, "(t.year, t.month, t.day)") == (2030, 2, 3)
         session.run("from machine import ADC, Pin\nadc = ADC(Pin(5), atten=ADC.ATTN_11DB)\nusb = Pin(42, Pin.IN)")
         assert evaluate(session, "usb.value()") == 1
+        # With a cable in, the battery divider sits on the USB rail, as on a real watch.
+        assert evaluate(session, "adc.read_uv()") == pytest.approx(4370 / 4 * 1000, rel=0.03)
+
+        watch.set_battery(usb=False)
+        assert evaluate(session, "usb.value()") == 0
         assert evaluate(session, "adc.read_uv()") == pytest.approx((3700 - 75) / 4 * 1000, rel=0.03)

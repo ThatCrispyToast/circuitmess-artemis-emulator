@@ -33,6 +33,7 @@ enum {
 };
 
 #define CS1_STOP      BIT(5)
+#define CS1_TESTC     BIT(3)
 #define CS2_AF        BIT(3)
 #define CS2_TF        BIT(2)
 #define ALARM_DISABLE BIT(7)
@@ -63,10 +64,30 @@ static int64_t current_epoch(ArtemisBm8563State *s)
     return s->base_epoch + (host_ns() - s->base_host_ns) / NANOSECONDS_PER_SECOND;
 }
 
+static int weekday_of(int64_t epoch)
+{
+    time_t t = epoch;
+    struct tm tm;
+
+    gmtime_r(&t, &tm);
+    return tm.tm_wday;
+}
+
 void artemis_bm8563_set_epoch(ArtemisBm8563State *s, int64_t epoch)
 {
     s->base_epoch = epoch;
     s->base_host_ns = host_ns();
+}
+
+/* The first of January in year 00 of the previous century, weekday 0. */
+#define POWER_UP_EPOCH (-2208988800LL)
+
+void artemis_bm8563_power_loss(ArtemisBm8563State *s)
+{
+    artemis_bm8563_set_epoch(s, POWER_UP_EPOCH);
+    s->weekday_shift = (7 - weekday_of(POWER_UP_EPOCH)) % 7;
+    s->low_voltage = true;
+    s->stopped = false;
 }
 
 static void check_alarm(ArtemisBm8563State *s, const struct tm *tm)
@@ -119,7 +140,7 @@ static void capture(ArtemisBm8563State *s)
     r[R_MINUTES] = to_bcd(tm.tm_min);
     r[R_HOURS] = to_bcd(tm.tm_hour);
     r[R_DAYS] = to_bcd(tm.tm_mday);
-    r[R_WEEKDAYS] = tm.tm_wday;
+    r[R_WEEKDAYS] = (tm.tm_wday + s->weekday_shift) % 7;
     r[R_MONTHS] = to_bcd(tm.tm_mon + 1) |
                   (tm.tm_year >= 100 ? MONTH_CENTURY : 0);
     r[R_YEARS] = to_bcd(tm.tm_year % 100);
@@ -143,6 +164,7 @@ static void commit_time(ArtemisBm8563State *s)
 
     s->low_voltage = r[R_SECONDS] & SECONDS_VL;
     artemis_bm8563_set_epoch(s, timegm(&tm));
+    s->weekday_shift = ((r[R_WEEKDAYS] & 7) + 7 - weekday_of(s->base_epoch)) % 7;
 }
 
 static void arm_timer(ArtemisBm8563State *s)
@@ -230,6 +252,7 @@ static void bm8563_realize(DeviceState *dev, Error **errp)
     artemis_bm8563_set_epoch(s, timegm(&local));
 
     memset(s->regs, 0, sizeof(s->regs));
+    s->regs[R_CS1] = CS1_TESTC;
     s->regs[R_ALARM_MIN] = ALARM_DISABLE;
     s->regs[R_ALARM_HOUR] = ALARM_DISABLE;
     s->regs[R_ALARM_DAY] = ALARM_DISABLE;
