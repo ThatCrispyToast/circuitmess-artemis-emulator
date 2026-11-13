@@ -13,26 +13,56 @@ diff -ruN a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
  
  /* -icount align implementation. */
  
-@@ -900,6 +905,63 @@
+@@ -559,6 +564,10 @@
+         tcg_ctx->gen_tb = NULL;
+     }
+ #endif
++    if (cpu->holds_clock) {
++        cpu->holds_clock = false;
++        cpu_clock_release();
++    }
+     if (bql_locked()) {
+         bql_unlock();
+     }
+@@ -900,6 +909,95 @@
      return false;
  }
  
 +bool tcg_insn_pacing;
 +uint32_t tcg_insn_pace_ps;
++uint32_t (*tcg_insn_pace_io_cost)(uint64_t addr, bool is_write);
 +
-+#define PACE_SLICE_INSNS    8192
++/*
++ * A slice is a couple of microseconds of the chip's time: the guest's clocks
++ * are that coarse-grained, and an interrupt can be that late.
++ */
++#define PACE_SLICE_INSNS    256
 +/* How far behind its pace a CPU may fall before the debt is written off. */
 +#define PACE_MAX_LAG_NS     (500 * SCALE_US)
 +/* Waits shorter than this are spun out, for the sake of accuracy. */
 +#define PACE_SPIN_NS        (60 * SCALE_US)
 +#define PACE_MAX_SLEEP_NS   (200 * SCALE_US)
 +
++int64_t tcg_insn_pace_ahead(void)
++{
++    CPUState *cpu = current_cpu;
++    const uint32_t ps = qatomic_read(&tcg_insn_pace_ps);
++    int64_t ahead;
++
++    if (!tcg_insn_pacing || !cpu || !cpu->insn_pace_started || ps == 0) {
++        return 0;
++    }
++    ahead = cpu->insn_pace_due +
++            (int64_t)(PACE_SLICE_INSNS - cpu->neg.insn_budget) * ps / 1000 - cpu_get_clock();
++    return CLAMP(ahead, 0, PACE_MAX_LAG_NS);
++}
++
 +/* The budget ran out: wait until the instructions run since should be done. */
 +static void cpu_insn_pace(CPUState *cpu)
 +{
 +    const uint32_t ps = qatomic_read(&tcg_insn_pace_ps);
 +    const int64_t ran = PACE_SLICE_INSNS - cpu->neg.insn_budget;
-+    int64_t now = get_clock();
++    int64_t now = cpu_get_clock();
 +    int64_t due;
 +
 +    cpu->neg.insn_budget = PACE_SLICE_INSNS;
@@ -58,8 +88,21 @@ diff -ruN a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
 +    }
 +    cpu->insn_pace_due = due;
 +
-+    /* Anything that wants this CPU's attention ends the wait; the time owed stays owed. */
-+    while (now < due && !cpu_loop_exit_requested(cpu)) {
++    /*
++     * Anything that wants this CPU's attention ends the wait; the time owed stays owed.
++     * A CPU that is here anyway also sees to timers the moment they fall due: left to
++     * the main loop they would be as late as it is in waking, tens of microseconds.
++     */
++    for (;;) {
++        if (qemu_clock_expired(QEMU_CLOCK_VIRTUAL)) {
++            bql_lock();
++            qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
++            bql_unlock();
++        }
++        if (now >= due || cpu_loop_exit_requested(cpu)) {
++            break;
++        }
++
 +        const int64_t left = due - now;
 +
 +        if (left > PACE_SPIN_NS) {
@@ -70,14 +113,14 @@ diff -ruN a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
 +        } else {
 +            cpu_relax();
 +        }
-+        now = get_clock();
++        now = cpu_get_clock();
 +    }
 +}
 +
  static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
                                      vaddr pc, TranslationBlock **last_tb,
                                      int *tb_exit)
-@@ -912,6 +974,12 @@
+@@ -912,6 +1010,12 @@
      }
  
      *last_tb = NULL;
@@ -90,6 +133,134 @@ diff -ruN a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
      if (cpu_loop_exit_requested(cpu)) {
          /* Something asked us to stop executing chained TBs; just
           * continue round the main loop. Whatever requested the exit
+@@ -990,7 +1094,16 @@
+                 uint32_t h;
+ 
+                 mmap_lock();
++                if (tcg_insn_pacing) {
++                    /* Translating takes the host a while, and the chip no time. */
++                    cpu->holds_clock = true;
++                    cpu_clock_hold();
++                }
+                 tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
++                if (cpu->holds_clock) {
++                    cpu->holds_clock = false;
++                    cpu_clock_release();
++                }
+                 mmap_unlock();
+ 
+                 /*
+diff -ruN a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -25,6 +25,7 @@
+ #include "exec/memory.h"
+ #include "exec/cpu_ldst.h"
+ #include "exec/cputlb.h"
++#include "sysemu/cpu-timers.h"
+ #include "exec/tb-flush.h"
+ #include "exec/memory-internal.h"
+ #include "exec/ram_addr.h"
+@@ -1964,6 +1965,31 @@
+     return ret_be;
+ }
+ 
++/*
++ * With instruction pacing, a device access is charged what it costs the real
++ * machine, and the VM clock stands still for what it costs the host.
++ */
++static bool io_pace_begin(CPUState *cpu, vaddr addr, bool is_write)
++{
++    if (!tcg_insn_pacing || cpu->holds_clock) {
++        return false;
++    }
++    if (tcg_insn_pace_io_cost) {
++        cpu->neg.insn_budget -= tcg_insn_pace_io_cost(addr, is_write);
++    }
++    cpu->holds_clock = true;
++    cpu_clock_hold();
++    return true;
++}
++
++static void io_pace_end(CPUState *cpu, bool held)
++{
++    if (held) {
++        cpu->holds_clock = false;
++        cpu_clock_release();
++    }
++}
++
+ static uint64_t do_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
+                                uint64_t ret_be, vaddr addr, int size,
+                                int mmu_idx, MMUAccessType type, uintptr_t ra)
+@@ -1972,6 +1998,8 @@
+     MemoryRegion *mr;
+     hwaddr mr_offset;
+     MemTxAttrs attrs;
++    uint64_t ret;
++    bool held;
+ 
+     tcg_debug_assert(size > 0 && size <= 8);
+ 
+@@ -1979,9 +2007,14 @@
+     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);
+     mr = section->mr;
+ 
+-    BQL_LOCK_GUARD();
+-    return int_ld_mmio_beN(cpu, full, ret_be, addr, size, mmu_idx,
+-                           type, ra, mr, mr_offset);
++    held = io_pace_begin(cpu, addr, false);
++    {
++        BQL_LOCK_GUARD();
++        ret = int_ld_mmio_beN(cpu, full, ret_be, addr, size, mmu_idx,
++                              type, ra, mr, mr_offset);
++    }
++    io_pace_end(cpu, held);
++    return ret;
+ }
+ 
+ static Int128 do_ld16_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
+@@ -2513,6 +2546,8 @@
+     hwaddr mr_offset;
+     MemoryRegion *mr;
+     MemTxAttrs attrs;
++    uint64_t ret;
++    bool held;
+ 
+     tcg_debug_assert(size > 0 && size <= 8);
+ 
+@@ -2520,9 +2555,14 @@
+     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);
+     mr = section->mr;
+ 
+-    BQL_LOCK_GUARD();
+-    return int_st_mmio_leN(cpu, full, val_le, addr, size, mmu_idx,
+-                           ra, mr, mr_offset);
++    held = io_pace_begin(cpu, addr, true);
++    {
++        BQL_LOCK_GUARD();
++        ret = int_st_mmio_leN(cpu, full, val_le, addr, size, mmu_idx,
++                              ra, mr, mr_offset);
++    }
++    io_pace_end(cpu, held);
++    return ret;
+ }
+ 
+ static uint64_t do_st16_mmio_leN(CPUState *cpu, CPUTLBEntryFull *full,
+diff -ruN a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -217,6 +217,10 @@
+          */
+         cpu->neg.icount_decr.u16.low += insns_left;
+     }
++    if (tcg_insn_pacing) {
++        /* The block was charged for whole when it started; these never ran. */
++        cpu->neg.insn_budget += insns_left;
++    }
+ 
+     cpu->cc->tcg_ops->restore_state_to_opc(cpu, tb, data);
+ }
 diff -ruN a/accel/tcg/translator.c b/accel/tcg/translator.c
 --- a/accel/tcg/translator.c
 +++ b/accel/tcg/translator.c
@@ -195,6 +366,195 @@ diff -ruN a/hw/block/m25p80.c b/hw/block/m25p80.c
              s->data[0] = (!!s->quad_enable) << 1;
              s->pos = 0;
              s->len = 1;
+diff -ruN a/hw/char/esp32s3_uart.c b/hw/char/esp32s3_uart.c
+--- a/hw/char/esp32s3_uart.c
++++ b/hw/char/esp32s3_uart.c
+@@ -22,6 +22,9 @@
+ #define ESP32_UART_AUTOBAUD A_UART_AUTOBAUD
+ #define ESP32_UART_CONF1    A_UART_CONF1
+ 
++#define A_ESP32S3_UART_CLKDIV    0x14
++#define A_ESP32S3_UART_CLK_CONF  0x78
++
+ static uint64_t esp32s3_uart_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+     ESP32S3UARTClass *class = ESP32S3_UART_GET_CLASS(opaque);
+@@ -35,6 +38,10 @@
+         r = s->conf1;
+         break;
+ 
++    case A_ESP32S3_UART_CLK_CONF:
++        r = s->clk_conf;
++        break;
++
+     default:
+         r = class->parent_uart_read(opaque, addr, size);
+         break;
+@@ -43,6 +50,19 @@
+     return r;
+ }
+ 
++/* The baud rate comes of a source clock, its divider, and the fractional divider after it. */
++static void esp32s3_uart_update_baud(ESP32S3UARTState *s)
++{
++    static const uint32_t source_hz[] = { 0, 80000000, 17500000, 40000000 };
++    uint32_t clkdiv = s->parent.reg[A_ESP32S3_UART_CLKDIV / 4];
++    uint32_t conf = s->clk_conf;
++    uint64_t divider = (uint64_t)((clkdiv & 0xFFF) << 4 | (clkdiv >> 20 & 0xF)) * ((conf >> 12 & 0xFF) + 1);
++
++    if (divider && source_hz[conf >> 20 & 3]) {
++        s->parent.baud_rate = ((uint64_t)source_hz[conf >> 20 & 3] << 4) / divider;
++    }
++}
++
+ static void esp32s3_uart_write(void *opaque, hwaddr addr,
+                        uint64_t value, unsigned int size)
+ {
+@@ -62,6 +82,16 @@
+             class->parent_uart_write(opaque, addr, value, size);
+             break;
+ 
++        case A_ESP32S3_UART_CLKDIV:
++            class->parent_uart_write(opaque, addr, value, size);
++            esp32s3_uart_update_baud(s);
++            break;
++
++        case A_ESP32S3_UART_CLK_CONF:
++            s->clk_conf = value;
++            esp32s3_uart_update_baud(s);
++            break;
++
+         case A_ESP32S3_UART_MEM_CONF:
+             s->parent.rx_tout_thres = FIELD_EX32(value, ESP32S3_UART_MEM_CONF, RX_TOUT_THRHD);
+             break;
+@@ -85,6 +115,18 @@
+     }
+ }
+ 
++static void esp32s3_uart_reset_hold(Object *obj, ResetType type)
++{
++    ESP32S3UARTState *s = ESP32S3_UART(obj);
++    ESP32S3UARTClass *class = ESP32S3_UART_GET_CLASS(obj);
++
++    if (class->parent_phases.hold) {
++        class->parent_phases.hold(obj, type);
++    }
++    /* The crystal, divided by two */
++    s->clk_conf = 0x03701000;
++}
++
+ static void esp32s3_uart_realize(DeviceState *dev, Error **errp)
+ {
+     // ESP32S3UARTState* esp32s3 = ESP32S3_UART(dev);
+@@ -113,6 +155,8 @@
+      * After doing this, it will be necessary for our function, esp32s3_uart_realize,
+      * to manually call the parent's one. */
+     device_class_set_parent_realize(dc, esp32s3_uart_realize, &esp32s3->parent_realize);
++    resettable_class_set_parent_phases(RESETTABLE_CLASS(klass), NULL, esp32s3_uart_reset_hold, NULL,
++                                       &esp32s3->parent_phases);
+ 
+     /* Override the UART operations functions */
+     esp32s3->parent_uart_write = esp32->uart_write;
+diff -ruN a/hw/char/esp32_uart.c b/hw/char/esp32_uart.c
+--- a/hw/char/esp32_uart.c
++++ b/hw/char/esp32_uart.c
+@@ -26,7 +26,6 @@
+ #include "trace.h"
+ 
+ 
+-static gboolean uart_transmit(void *do_not_use, GIOCondition cond, void *opaque);
+ static void uart_receive(void *opaque, const uint8_t *buf, int size);
+ 
+ 
+@@ -73,6 +72,16 @@
+ }
+ 
+ 
++/* How long a character takes to send: its start bit, data bits, parity and stop bits. */
++static int64_t uart_character_ns(ESP32UARTState *s)
++{
++    static const int stop_halves[] = { 2, 2, 3, 4 };
++    uint32_t conf0 = s->reg[R_UART_CONF0];
++    int halves = 2 * (1 + 5 + (conf0 >> 2 & 3) + (conf0 >> 1 & 1)) + stop_halves[conf0 >> 4 & 3];
++
++    return halves * (NANOSECONDS_PER_SECOND / 2) / MAX(s->baud_rate, 1);
++}
++
+ static uint64_t uart_read(void *opaque, hwaddr addr, unsigned int size)
+ {
+     ESP32UARTState *s = ESP32_UART(opaque);
+@@ -136,7 +145,10 @@
+             error_report("esp_uart: write to UART FIFO while it is full");
+         } else {
+             fifo8_push(&s->tx_fifo, (uint8_t) (value & 0xff));
+-            uart_transmit(NULL, G_IO_OUT, s);
++            if (!timer_pending(&s->tx_timer)) {
++                s->tx_due = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + uart_character_ns(s);
++                timer_mod_ns(&s->tx_timer, s->tx_due);
++            }
+         }
+         break;
+ 
+@@ -210,33 +222,24 @@
+ }
+ 
+ 
+-static gboolean uart_transmit(void *do_not_use, GIOCondition cond, void *opaque)
++/* A character has had its time on the wire: it leaves the FIFO, and the next one starts. */
++static void uart_tx_timer_cb(void *opaque)
+ {
+     ESP32UARTState *s = ESP32_UART(opaque);
+ 
+-    s->tx_watch_handle = 0;
++    if (fifo8_num_used(&s->tx_fifo) > 0) {
++        uint8_t b = fifo8_pop(&s->tx_fifo);
+ 
+-    /* drain the fifo instantly, if the char device backend is not connected */
+-    if (!qemu_chr_fe_backend_open(&s->chr)) {
+-        fifo8_reset(&s->tx_fifo);
+-        return FALSE;
+-    }
+-
+-    while (fifo8_num_used(&s->tx_fifo) > 0) {
+-        uint8_t b = fifo8_peek(&s->tx_fifo);
+-        int r = qemu_chr_fe_write(&s->chr, &b, 1);
+-        if (r == 1) {
+-            fifo8_pop(&s->tx_fifo);
+-        } else {
+-            s->tx_watch_handle = qemu_chr_fe_add_watch(&s->chr, G_IO_OUT | G_IO_HUP,
+-                                                       uart_transmit, s);
+-            break;
++        if (qemu_chr_fe_backend_open(&s->chr)) {
++            qemu_chr_fe_write_all(&s->chr, &b, 1);
+         }
+     }
++    if (fifo8_num_used(&s->tx_fifo) > 0) {
++        s->tx_due += uart_character_ns(s);
++        timer_mod_ns(&s->tx_timer, s->tx_due);
++    }
+ 
+     esp32_uart_update_irq(s);
+-
+-    return FALSE;
+ }
+ 
+ static void uart_receive(void *opaque, const uint8_t *buf, int size)
+@@ -329,6 +332,7 @@
+         s->tx_watch_handle = 0;
+     }
+     timer_del(&s->throttle_timer);
++    timer_del(&s->tx_timer);
+     s->throttle_rx = false;
+     s->rx_tout_ena = false;
+     s->tx_empty_threshold = 0;
+@@ -367,6 +371,7 @@
+     fifo8_create(&s->rx_fifo, UART_FIFO_LENGTH);
+     timer_init_ns(&s->throttle_timer, QEMU_CLOCK_VIRTUAL, uart_throttle_timer_cb, s);
+     timer_init_ns(&s->rx_timeout_timer, QEMU_CLOCK_VIRTUAL, uart_rx_timeout_timer_cb, s);
++    timer_init_ns(&s->tx_timer, QEMU_CLOCK_VIRTUAL, uart_tx_timer_cb, s);
+ }
+ 
+ 
 diff -ruN a/hw/dma/esp_gdma.c b/hw/dma/esp_gdma.c
 --- a/hw/dma/esp_gdma.c
 +++ b/hw/dma/esp_gdma.c
@@ -374,10 +734,142 @@ diff -ruN a/hw/meson.build b/hw/meson.build
  subdir('audio')
  subdir('block')
  subdir('char')
+diff -ruN a/hw/misc/esp32s3_cache.c b/hw/misc/esp32s3_cache.c
+--- a/hw/misc/esp32s3_cache.c
++++ b/hw/misc/esp32s3_cache.c
+@@ -24,6 +24,7 @@
+ #include "hw/misc/esp32s3_xts_aes.h"
+ #include "sysemu/block-backend-io.h"
+ #include "hw/misc/esp32s3_reg.h"
++#include "hw/artemis/artemis.h"
+ 
+ 
+ #define CACHE_DEBUG      0
+@@ -35,6 +36,9 @@
+  *        `done` flag is returned and the `enable` flag is cleared from register.
+  *        Else, 0 is returned.
+ */
++/* Which bits of each register hold what is written to them. */
++static uint32_t cache_writable[ESP32S3_CACHE_REG_COUNT];
++
+ static inline uint32_t check_and_reset_ena(uint32_t* hwreg, uint32_t ena_mask, uint32_t done_mask)
+ {
+     uint32_t regval = *hwreg;
+@@ -130,24 +134,18 @@
+     }
+ 
+     switch(addr) {
++        /* The control registers read back as written, like the rest */
+         case A_EXTMEM_DCACHE_CTRL:
+-            r = s->dcache_enable;
+-            break;
+         case A_EXTMEM_DCACHE_CTRL1:
+-            r = s->dcache_enable;
+-            break;
+         case A_EXTMEM_ICACHE_CTRL:
+-            r = s->icache_enable;
+-            break;
+         case A_EXTMEM_ICACHE_CTRL1:
+-            r = s->icache_enable;
++            r = s->regs[index];
+             break;
+         /* For the following registers, mark the bit as done only if the feature was enabled */
+         case A_EXTMEM_DCACHE_SYNC_CTRL:
+-            s->regs[index] |= 1<<3;
+-            r = check_and_reset_ena(&s->regs[index],
+-                                    R_EXTMEM_DCACHE_SYNC_CTRL_INVALIDATE_ENA_MASK,
+-                                    R_EXTMEM_DCACHE_SYNC_CTRL_SYNC_DONE_MASK);
++            /* Whatever was asked for (invalidate, write back, clean) is done at once */
++            s->regs[index] = (s->regs[index] & ~0x7) | 1<<3;
++            r = s->regs[index];
+             break;
+         case A_EXTMEM_ICACHE_SYNC_CTRL:
+             r = check_and_reset_ena(&s->regs[index],
+@@ -187,9 +185,6 @@
+             r = 1 << R_EXTMEM_CACHE_STATE_DCACHE_STATE_SHIFT;
+             r |= 1 << R_EXTMEM_CACHE_STATE_ICACHE_STATE_SHIFT;
+             break;
+-        case A_EXTMEM_DCACHE_SYNC_SIZE:
+-            break;
+-
+         case ESP32S3_MMU_TABLE_OFFSET ... (ESP32S3_MMU_TABLE_OFFSET + ESP32S3_MMU_SIZE):
+ #if CACHE_WARNING
+             info_report("[CACHE] Reading 0x%lx (0x%lx)", addr, r);
+@@ -197,9 +192,10 @@
+             r = esp32s3_read_mmu_value(s, addr - ESP32S3_MMU_TABLE_OFFSET);
+             break;
+         default:
+-#if CACHE_WARNING
+-            warn_report("[CACHE] Unsupported read to 0x%lx", addr);
+-#endif
++            /* Nothing is done with the others, but they hold what they are given */
++            if (index < ESP32S3_CACHE_REG_COUNT) {
++                r = s->regs[index];
++            }
+             break;
+     }
+ 
+@@ -221,15 +217,19 @@
+         switch (addr) {
+             case A_EXTMEM_DCACHE_CTRL:
+                 s->dcache_enable = value & 1;
++                s->regs[index] = value;
+                 break;
+             case A_EXTMEM_DCACHE_CTRL1:
+                 s->dcache_enable = value & 1;
++                s->regs[index] = value;
+                 break;
+             case A_EXTMEM_ICACHE_CTRL:
+                 s->icache_enable = value & 1;
++                s->regs[index] = value;
+                 break;
+             case A_EXTMEM_ICACHE_CTRL1:
+                 s->icache_enable = value & 1;
++                s->regs[index] = value;
+                 break;
+             case A_EXTMEM_ICACHE_FREEZE:
+                 if (value & R_EXTMEM_ICACHE_FREEZE_ICACHE_FREEZE_ENA_MASK) {
+@@ -250,7 +250,8 @@
+                 }
+                 break;
+             default:
+-                s->regs[index] = value;
++                /* Only the bits that hold what they're given: the rest are commands or status */
++                s->regs[index] = (s->regs[index] & ~cache_writable[index]) | (value & cache_writable[index]);
+                 break;
+         }
+     } else if (addr >= ESP32S3_MMU_TABLE_OFFSET) {
+@@ -273,6 +274,7 @@
+ {
+     ESP32S3CacheState *s = ESP32S3_CACHE(obj);
+     memset(s->regs, 0, ESP32S3_CACHE_REG_COUNT * sizeof(*s->regs));
++    artemis_socregs_describe(DR_REG_EXTMEM_BASE, s->regs, cache_writable, ESP32S3_CACHE_REG_COUNT);
+ 
+     /* Initialize the MMU with invalid entries */
+     for (int i = 0; i < ESP32S3_MMU_TABLE_ENTRY_COUNT; i++) {
+@@ -280,14 +282,14 @@
+     }
+ 
+     /* On reset, autoload must be set to done (ready) */
+-    s->regs[ESP32S3_CACHE_REG_IDX(A_EXTMEM_ICACHE_AUTOLOAD_CTRL)] = R_EXTMEM_ICACHE_AUTOLOAD_CTRL_AUTOLOAD_DONE_MASK;
++    s->regs[ESP32S3_CACHE_REG_IDX(A_EXTMEM_ICACHE_AUTOLOAD_CTRL)] |= R_EXTMEM_ICACHE_AUTOLOAD_CTRL_AUTOLOAD_DONE_MASK;
+     /* Same goes for the manual preload */
+-    s->regs[ESP32S3_CACHE_REG_IDX(A_EXTMEM_ICACHE_PRELOAD_CTRL)] = R_EXTMEM_ICACHE_PRELOAD_CTRL_PRELOAD_DONE_MASK;
++    s->regs[ESP32S3_CACHE_REG_IDX(A_EXTMEM_ICACHE_PRELOAD_CTRL)] |= R_EXTMEM_ICACHE_PRELOAD_CTRL_PRELOAD_DONE_MASK;
+ 
+     /* On reset, autoload must be set to done (ready) */
+-    s->regs[ESP32S3_CACHE_REG_IDX(A_EXTMEM_DCACHE_AUTOLOAD_CTRL)] = R_EXTMEM_DCACHE_AUTOLOAD_CTRL_AUTOLOAD_DONE_MASK;
++    s->regs[ESP32S3_CACHE_REG_IDX(A_EXTMEM_DCACHE_AUTOLOAD_CTRL)] |= R_EXTMEM_DCACHE_AUTOLOAD_CTRL_AUTOLOAD_DONE_MASK;
+     /* Same goes for the manual preload */
+-    s->regs[ESP32S3_CACHE_REG_IDX(A_EXTMEM_DCACHE_PRELOAD_CTRL)] = R_EXTMEM_DCACHE_PRELOAD_CTRL_PRELOAD_DONE_MASK;
++    s->regs[ESP32S3_CACHE_REG_IDX(A_EXTMEM_DCACHE_PRELOAD_CTRL)] |= R_EXTMEM_DCACHE_PRELOAD_CTRL_PRELOAD_DONE_MASK;
+ }
+ 
+ static void esp32s3_cache_realize(DeviceState *dev, Error **errp)
 diff -ruN a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
 --- a/hw/misc/esp32s3_rtc_cntl.c
 +++ b/hw/misc/esp32s3_rtc_cntl.c
-@@ -20,9 +20,44 @@
+@@ -20,9 +20,76 @@
  #include "hw/qdev-properties.h"
  #include "hw/misc/esp32s3_reg.h"
  #include "hw/misc/esp32s3_rtc_cntl.h"
@@ -395,14 +887,46 @@ diff -ruN a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
 +#define ART_DIG_PWC         0x90
 +#define ART_EXT_WAKEUP1     0xE0
 +#define ART_EXT_WAKEUP1_ST  0xE4
++#define ART_WDTCONFIG0      0x98
++#define ART_WDTCONFIG1      0x9C
++#define ART_WDTCONFIG4      0xA8
++#define ART_WDTFEED         0xAC
++#define ART_WDTWPROTECT     0xB0
 +#define ART_WAKEUP_CAUSE    0x130
++#define ART_INT_ENA_W1TS    0x138
++#define ART_INT_ENA_W1TC    0x13C
++
++/* Which bits of each register hold what is written to them. */
++static uint32_t rtc_cntl_writable[0x200 / 4];
 +
 +#define ART_SLEEP_EN        BIT(31)
 +#define ART_DG_WRAP_PD_EN   BIT(31)
 +#define ART_TIMER_ALARM_EN  BIT(16)
 +#define ART_WAKEUP_ENA_S    15
 +#define ART_INT_SLP_WAKEUP  BIT(0)
++#define ART_INT_WDT         BIT(3)
 +#define ART_INT_MAIN_TIMER  BIT(10)
++
++/* RESET_STATE: a flag per core, each cleared by writing the bit two places up */
++#define ART_RESET_FLAGS     (BIT(14) | BIT(15))
++
++#define ART_WDT_KEY         0x50D83AA1
++#define ART_WDT_EN          BIT(31)
++#define ART_WDT_STAGE_S(n)  (28 - 3 * (n))
++#define ART_WDT_FLASHBOOT   BIT(12)
++#define ART_WDT_PROCPU_RST  BIT(11)
++#define ART_WDT_APPCPU_RST  BIT(10)
++#define ART_WDT_PAUSE_SLP   BIT(9)
++#define ART_WDT_FEED        BIT(31)
++
++enum {
++    ART_WDT_OFF,
++    ART_WDT_INTERRUPT,
++    ART_WDT_RESET_CPU,
++    ART_WDT_RESET_SYSTEM,
++    ART_WDT_RESET_RTC,
++};
++#define ART_INT_COCPU_TRAP  BIT(17)
 +#define ART_EXT1_LV         BIT(31)
 +#define ART_EXT0_LV         BIT(30)
 +#define ART_EXT1_SEL_M      0x3FFFFF
@@ -422,13 +946,36 @@ diff -ruN a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
  
  static uint64_t esp32s3_rtc_cntl_read(void *opaque, hwaddr addr, unsigned int size)
  {
-@@ -72,6 +107,16 @@
+@@ -33,7 +100,8 @@
+         r = s->options0_reg;
+         break;
+     case A_RTC_CNTL_TIME_UPDATE:
+-        r = R_RTC_CNTL_TIME_UPDATE_VALID_MASK;
++        /* No "valid" bit on this chip: the time is there as soon as it is asked for */
++        r = s->regs[addr / 4];
+         break;
+     case A_RTC_CNTL_TIME0:
+         r = s->time_reg & UINT32_MAX;
+@@ -47,6 +115,7 @@
+         r = FIELD_DP32(r, RTC_CNTL_RESET_STATE, RESET_CAUSE_APPCPU, s->reset_cause[1]);
+         r = FIELD_DP32(r, RTC_CNTL_RESET_STATE, PROCPU_STAT_VECTOR_SEL, s->stat_vector_sel[0]);
+         r = FIELD_DP32(r, RTC_CNTL_RESET_STATE, APPCPU_STAT_VECTOR_SEL, s->stat_vector_sel[1]);
++        r |= s->reset_flags;
+         break;
+ 
+     case A_RTC_CNTL_STORE0:
+@@ -72,10 +141,142 @@
      case A_RTC_CNTL_STORE7:
          r = s->scratch_reg[(addr - A_RTC_CNTL_STORE4) / 4 + 4];
          break;
 +
 +    case ART_INT_ST:
 +        r = s->regs[ART_INT_RAW / 4] & s->regs[ART_INT_ENA / 4];
++        break;
++
++    case ART_SLP_TIMER1:
++        /* Arming the alarm is a command: the bit doesn't read back */
++        r = s->regs[addr / 4] & ~ART_TIMER_ALARM_EN;
 +        break;
 +
 +    default:
@@ -439,7 +986,150 @@ diff -ruN a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
      }
      return r;
  }
-@@ -142,9 +187,126 @@
+ 
++static void esp32s3_rtc_update_irq(Esp32s3RtcCntlState *s)
++{
++    qemu_set_irq(s->irq, !!(s->regs[ART_INT_RAW / 4] & s->regs[ART_INT_ENA / 4]));
++}
++
++/*
++ * The RTC watchdog, as timed on a watch. It counts the slow clock through up to
++ * four stages, each ending in an interrupt, a reset of the CPUs, of the digital
++ * system, or of the whole chip; a stage set to do nothing takes no time. Out of
++ * reset it guards the boot from flash on its own, until the bootloader takes
++ * it over. Stage 0 lasts twice what its register says.
++ */
++static bool esp32s3_rtc_wdt_counting(Esp32s3RtcCntlState *s)
++{
++    uint32_t config = s->regs[ART_WDTCONFIG0 / 4];
++
++    if (s->wdt_disable || !(config & (ART_WDT_EN | ART_WDT_FLASHBOOT))) {
++        return false;
++    }
++    return !(s->sleeping && (config & ART_WDT_PAUSE_SLP));
++}
++
++static int esp32s3_rtc_wdt_action(Esp32s3RtcCntlState *s, int stage)
++{
++    uint32_t config = s->regs[ART_WDTCONFIG0 / 4];
++
++    if (!(config & ART_WDT_EN)) {
++        /* Guarding the boot from flash */
++        return stage == 0 ? ART_WDT_RESET_SYSTEM : ART_WDT_OFF;
++    }
++    return config >> ART_WDT_STAGE_S(stage) & 7;
++}
++
++static void esp32s3_rtc_wdt_arm(Esp32s3RtcCntlState *s)
++{
++    uint64_t ticks;
++
++    timer_del(s->wdt_timer);
++    if (!esp32s3_rtc_wdt_counting(s)) {
++        return;
++    }
++    for (int skipped = 0; esp32s3_rtc_wdt_action(s, s->wdt_stage) == ART_WDT_OFF; skipped++) {
++        if (skipped == 4) {
++            return;
++        }
++        s->wdt_stage = (s->wdt_stage + 1) % 4;
++    }
++    ticks = s->regs[ART_WDTCONFIG1 / 4 + s->wdt_stage];
++    if (s->wdt_stage == 0) {
++        ticks <<= 1;
++    }
++    timer_mod(s->wdt_timer, s->wdt_stage_start +
++              muldiv64(ticks, NANOSECONDS_PER_SECOND, s->rtc_slowclk_freq));
++}
++
++static void esp32s3_rtc_wdt_restart(Esp32s3RtcCntlState *s)
++{
++    s->wdt_stage = 0;
++    s->wdt_stage_start = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    esp32s3_rtc_wdt_arm(s);
++}
++
++static void esp32s3_rtc_wdt_expired(void *opaque)
++{
++    Esp32s3RtcCntlState *s = ESP32S3_RTC_CNTL(opaque);
++    uint32_t config = s->regs[ART_WDTCONFIG0 / 4];
++    int action = esp32s3_rtc_wdt_action(s, s->wdt_stage);
++
++    s->wdt_stage = (s->wdt_stage + 1) % 4;
++    s->wdt_stage_start = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    switch (action) {
++    case ART_WDT_INTERRUPT:
++        s->regs[ART_INT_RAW / 4] |= ART_INT_WDT;
++        esp32s3_rtc_update_irq(s);
++        break;
++    case ART_WDT_RESET_CPU:
++        if (config & ART_WDT_PROCPU_RST) {
++            s->reset_cause[0] = ESP32_RTCWDT_CPU_RESET;
++            qemu_irq_pulse(s->cpu_reset_req[0]);
++        }
++        if (config & ART_WDT_APPCPU_RST) {
++            s->reset_cause[1] = ESP32_RTCWDT_CPU_RESET;
++            qemu_irq_pulse(s->cpu_reset_req[1]);
++        }
++        break;
++    case ART_WDT_RESET_SYSTEM:
++        s->reset_cause[0] = ESP32_RTCWDT_SYS_RESET;
++        s->reset_cause[1] = ESP32_RTCWDT_SYS_RESET;
++        qemu_irq_pulse(s->dig_reset_req);
++        break;
++    case ART_WDT_RESET_RTC:
++        /* The RTC domain goes too, this watchdog with it */
++        qemu_irq_pulse(s->rtc_reset_req);
++        return;
++    default:
++        break;
++    }
++    esp32s3_rtc_wdt_arm(s);
++}
++
++/* Sleep stops the count, if the watchdog is set to pause, and waking carries it on. */
++static void esp32s3_rtc_wdt_sleep(Esp32s3RtcCntlState *s, bool asleep)
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    if (!(s->regs[ART_WDTCONFIG0 / 4] & ART_WDT_PAUSE_SLP)) {
++        return;
++    }
++    if (asleep) {
++        s->wdt_paused_after = now - s->wdt_stage_start;
++    } else {
++        s->wdt_stage_start = now - s->wdt_paused_after;
++    }
++    esp32s3_rtc_wdt_arm(s);
++}
++
+ static void esp32s3_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
+                                  unsigned int size)
+ {
+@@ -98,11 +299,12 @@
+             qemu_irq_pulse(s->cpu_reset_req[0]);
+             value &= ~(R_RTC_CNTL_OPTIONS0_SW_PROCPU_RESET_MASK);
+         }
+-        s->options0_reg = value;
++        s->options0_reg = value & rtc_cntl_writable[addr / 4];
+         esp32s3_rtc_update_cpu_stall(s);
+         break;
+ 
+     case A_RTC_CNTL_TIME_UPDATE:
++        s->regs[addr / 4] = value & rtc_cntl_writable[addr / 4];
+         if (value & R_RTC_CNTL_TIME_UPDATE_UPDATE_MASK) {
+             s->time_reg = muldiv64(
+                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->time_base_ns,
+@@ -111,6 +313,7 @@
+         break;
+ 
+     case A_RTC_CNTL_RESET_STATE:
++        s->reset_flags &= ~(value >> 2 & ART_RESET_FLAGS);
+         s->stat_vector_sel[0] = FIELD_EX32(value, RTC_CNTL_RESET_STATE,
+                                            PROCPU_STAT_VECTOR_SEL);
+         s->stat_vector_sel[1] = FIELD_EX32(value, RTC_CNTL_RESET_STATE,
+@@ -142,9 +345,186 @@
      case A_RTC_CNTL_STORE7:
          s->scratch_reg[(addr - A_RTC_CNTL_STORE4) / 4 + 4] = value;
          break;
@@ -449,23 +1139,69 @@ diff -ruN a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
 +        if (value & ART_SLEEP_EN) {
 +            s->deep_sleep = s->regs[ART_DIG_PWC / 4] & ART_DG_WRAP_PD_EN;
 +            s->sleeping = true;
++            esp32s3_rtc_wdt_sleep(s, true);
 +            qemu_set_irq(s->sleep_stall, 1);
 +            esp32s3_rtc_sleep_evaluate(s);
 +        }
 +        break;
 +
++    case ART_SLP_TIMER1:
++        s->regs[addr / 4] = value;
++        break;
++
 +    case ART_INT_CLR:
-+        s->regs[ART_INT_RAW / 4] &= ~value;
++        /* The coprocessor's trap line reads as raised for as long as it isn't running */
++        s->regs[ART_INT_RAW / 4] &= ~value | ART_INT_COCPU_TRAP;
++        esp32s3_rtc_update_irq(s);
++        break;
++
++    case ART_INT_ENA:
++        s->regs[addr / 4] = value;
++        esp32s3_rtc_update_irq(s);
++        break;
++
++    case ART_INT_ENA_W1TS:
++        s->regs[ART_INT_ENA / 4] |= value;
++        esp32s3_rtc_update_irq(s);
++        break;
++
++    case ART_INT_ENA_W1TC:
++        s->regs[ART_INT_ENA / 4] &= ~value;
++        esp32s3_rtc_update_irq(s);
++        break;
++
++    case ART_WDTCONFIG0 ... ART_WDTCONFIG4:
++        /* The watchdog's registers only take writes while its key is in */
++        if (s->regs[ART_WDTWPROTECT / 4] == ART_WDT_KEY) {
++            bool was_counting = esp32s3_rtc_wdt_counting(s);
++
++            s->regs[addr / 4] = value;
++            if (!was_counting) {
++                /* It counts from nothing when it is turned on */
++                esp32s3_rtc_wdt_restart(s);
++            } else {
++                esp32s3_rtc_wdt_arm(s);
++            }
++        }
++        break;
++
++    case ART_WDTFEED:
++        if (s->regs[ART_WDTWPROTECT / 4] == ART_WDT_KEY && (value & ART_WDT_FEED)) {
++            esp32s3_rtc_wdt_restart(s);
++        }
 +        break;
 +
 +    default:
 +        if (addr < sizeof(s->regs)) {
-+            s->regs[addr / 4] = value;
++            /* Only the bits that hold what they're given: the rest are commands or status */
++            const uint32_t writable = rtc_cntl_writable[addr / 4];
++
++            s->regs[addr / 4] = (s->regs[addr / 4] & ~writable) | (value & writable);
 +        }
 +        break;
-+    }
-+}
-+
+     }
+ }
+ 
 +static uint64_t esp32s3_rtc_now_ticks(Esp32s3RtcCntlState *s)
 +{
 +    return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->time_base_ns,
@@ -475,6 +1211,7 @@ diff -ruN a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
 +static void esp32s3_rtc_wake(Esp32s3RtcCntlState *s, uint32_t cause)
 +{
 +    s->sleeping = false;
++    esp32s3_rtc_wdt_sleep(s, false);
 +    timer_del(s->sleep_timer);
 +    s->regs[ART_WAKEUP_CAUSE / 4] = cause;
 +    qemu_set_irq(s->sleep_stall, 0);
@@ -486,9 +1223,10 @@ diff -ruN a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
 +        qemu_irq_pulse(s->dig_reset_req);
 +    } else {
 +        s->regs[ART_INT_RAW / 4] |= ART_INT_SLP_WAKEUP;
-     }
- }
- 
++        esp32s3_rtc_update_irq(s);
++    }
++}
++
 +static void esp32s3_rtc_sleep_evaluate(Esp32s3RtcCntlState *s)
 +{
 +    uint32_t ena = s->regs[ART_WAKEUP_STATE / 4] >> ART_WAKEUP_ENA_S;
@@ -560,31 +1298,72 @@ diff -ruN a/hw/misc/esp32s3_rtc_cntl.c b/hw/misc/esp32s3_rtc_cntl.c
 +    s->sleeping = false;
 +    timer_del(s->sleep_timer);
 +    memset(s->regs, 0, sizeof(s->regs));
-+    artemis_socregs_load(DR_REG_RTCCNTL_BASE, s->regs, ARRAY_SIZE(s->regs));
++    artemis_socregs_describe(DR_REG_RTCCNTL_BASE, s->regs, rtc_cntl_writable, ARRAY_SIZE(s->regs));
++    s->options0_reg = s->regs[A_RTC_CNTL_OPTIONS0 / 4];
++    esp32s3_rtc_update_irq(s);
++}
++
++/* The RTC domain starts from nothing: after power comes on, or its watchdog's last resort. */
++void esp32s3_rtc_cntl_power_on(Esp32s3RtcCntlState *s)
++{
++    esp32s3_rtc_cntl_cancel_sleep(s);
++    memset(s->scratch_reg, 0, sizeof(s->scratch_reg));
++    s->time_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    s->time_reg = 0;
++    esp32s3_rtc_wdt_restart(s);
 +}
 +
  static void esp32s3_rtc_update_cpu_stall(Esp32s3RtcCntlState* s)
  {
      uint32_t procpu_stall = (FIELD_EX32(s->sw_cpu_stall_reg, RTC_CNTL_SW_CPU_STALL, PROCPU_C1) << 2) |
-@@ -164,7 +326,7 @@
+@@ -164,7 +544,8 @@
  
  static void esp32s3_rtc_update_clk(Esp32s3RtcCntlState* s)
  {
 -    const uint32_t slowclk_freq[] = {150000, 32768, 8000000/256};
-+    const uint32_t slowclk_freq[] = {136000, 32768, 17500000/256};
++    /* The RC oscillator is 136 kHz nominally; this is what a watch's runs at */
++    const uint32_t slowclk_freq[] = {150600, 32768, 17500000/256};
      const uint32_t fastclk_freq[] = {s->xtal_apb_freq / 4, 8000000};
      s->rtc_slowclk_freq = slowclk_freq[s->rtc_slowclk];
      s->rtc_fastclk_freq = fastclk_freq[s->rtc_fastclk];
-@@ -201,6 +363,9 @@
+@@ -181,7 +562,15 @@
+ {
+     Esp32s3RtcCntlState *s = ESP32S3_RTC_CNTL(obj);
+ 
+-    s->time_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    s->reset_flags = ART_RESET_FLAGS;
++
++    /* The RTC domain sits out a reset of the digital system: its clock and its
++     * watchdog carry on. Only the machine's first reset finds them not yet started. */
++    if (!s->started) {
++        s->started = true;
++        s->time_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++        esp32s3_rtc_wdt_restart(s);
++    }
+ }
+ 
+ static void esp32s3_rtc_cntl_realize(DeviceState *dev, Error **errp)
+@@ -201,6 +590,12 @@
      qdev_init_gpio_out_named(DEVICE(sbd), &s->cpu_reset_req[0], ESP32S3_RTC_CPU_RESET_GPIO, ESP32S3_CPU_COUNT);
      qdev_init_gpio_out_named(DEVICE(sbd), &s->cpu_stall_req[0], ESP32S3_RTC_CPU_STALL_GPIO, ESP32S3_CPU_COUNT);
      qdev_init_gpio_out_named(DEVICE(sbd), &s->clk_update, ESP32S3_RTC_CLK_UPDATE_GPIO, 1);
 +    qdev_init_gpio_out_named(DEVICE(sbd), &s->sleep_stall, ESP32S3_RTC_SLEEP_STALL_GPIO, 1);
 +    s->sleep_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32s3_rtc_sleep_timer_cb, s);
-+    artemis_socregs_load(DR_REG_RTCCNTL_BASE, s->regs, ARRAY_SIZE(s->regs));
++    s->wdt_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, esp32s3_rtc_wdt_expired, s);
++    qdev_init_gpio_out_named(DEVICE(sbd), &s->rtc_reset_req, ESP32S3_RTC_RTC_RESET_GPIO, 1);
++    artemis_socregs_describe(DR_REG_RTCCNTL_BASE, s->regs, rtc_cntl_writable, ARRAY_SIZE(s->regs));
++    s->options0_reg = s->regs[A_RTC_CNTL_OPTIONS0 / 4];
  
      for (int i = 0; i < ESP32S3_CPU_COUNT; ++i) {
          s->reset_cause[i] = ESP32_POWERON_RESET;
+@@ -216,6 +611,7 @@
+ }
+ 
+ static Property esp32s3_rtc_cntl_properties[] = {
++    DEFINE_PROP_BOOL("wdt_disable", Esp32s3RtcCntlState, wdt_disable, false),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
 diff -ruN a/hw/timer/esp_systimer.c b/hw/timer/esp_systimer.c
 --- a/hw/timer/esp_systimer.c
 +++ b/hw/timer/esp_systimer.c
@@ -723,7 +1502,22 @@ diff -ruN a/hw/timer/esp_systimer.c b/hw/timer/esp_systimer.c
              break;
  
  
-@@ -361,9 +371,17 @@
+@@ -317,8 +327,13 @@
+     if (counter->enabled) {
+         esp_systimer_update_counter(counter);
+     }
+-    /* In any case, flush the value to send to the guest program */
++    /* In any case, flush the value to send to the guest program, which may have run a
++     * little ahead of the clock */
+     counter->flushed = counter->value;
++    if (counter->enabled) {
++        counter->flushed = (counter->flushed +
++                            tcg_insn_pace_ahead() * ESP_SYSTIMER_CNT_PER_US / 1000) & ESP_SYSTIMER_52BIT_MASK;
++    }
+ }
+ 
+ /**
+@@ -361,9 +376,17 @@
  
  static void esp_systimer_comparator_reload(ESPSysTimerComp* comparator)
  {
@@ -741,7 +1535,7 @@ diff -ruN a/hw/timer/esp_systimer.c b/hw/timer/esp_systimer.c
      if (comparator->enabled) {
          /* The period changed, reprogram the QEMU timer */
          esp_systimer_comparator_reprogram(comparator);
-@@ -378,9 +396,20 @@
+@@ -378,9 +401,20 @@
  
      for (int i = 0; i < ESP_SYSTIMER_COUNTER_COUNT; i++) {
          state_counter[i] = s->counter[i].enabled;
@@ -765,7 +1559,38 @@ diff -ruN a/hw/timer/esp_systimer.c b/hw/timer/esp_systimer.c
 diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
 --- a/hw/timer/esp_timg.c
 +++ b/hw/timer/esp_timg.c
-@@ -98,8 +98,9 @@
+@@ -46,10 +46,11 @@
+ static int64_t esp_virtual_counter_update(ESPVirtualCounter *counter)
+ {
+     const int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+-    const int64_t elapsed_ns = now - counter->base;
+-    const int64_t ticks = (elapsed_ns * (counter->frequency / 1000)) / 1000000;
++    const int64_t elapsed_ns = MAX(now - (int64_t) counter->base, 0);
++    const int64_t ticks = muldiv64(elapsed_ns, counter->frequency, NANOSECONDS_PER_SECOND);
+     counter->value += ticks;
+-    counter->base = now;
++    /* Whole ticks only: the part of one that has gone by counts towards the next reading */
++    counter->base += muldiv64(ticks, NANOSECONDS_PER_SECOND, counter->frequency);
+     return counter->value;
+ }
+ 
+@@ -60,12 +61,13 @@
+ 
+ static void esp_virtual_counter_alarm_in_ticks(ESPVirtualCounter *counter, int64_t ticks)
+ {
+-    int64_t delay_ns = (ticks * (1000000000UL / counter->frequency));
++    int64_t delay_ns = muldiv64(ticks, NANOSECONDS_PER_SECOND, counter->frequency);
+     const int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+     /* This function will reschedule the clock if it was already scheduled */
+     counter->base = now;
+     counter->value = 0;
+-    timer_mod_ns(&counter->timer, now + delay_ns);
++    counter->due = now + delay_ns;
++    timer_mod_ns(&counter->timer, counter->due);
+ }
+ 
+ /**
+@@ -98,8 +100,9 @@
          [ESP_TIMG_CALI_RC_FAST_DIV_CLK] = ESP_RC_FAST_DIV_FREQ,
          [ESP_TIMG_CALI_XTAL32K_CLK]     = ESP_XTAL32K_FREQ
      };
@@ -777,7 +1602,7 @@ diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
  
      /* Check if a start (one-time or periodic) was triggered */
      if (value & (R_TIMG_RTCCALICFG_START_MASK | R_TIMG_RTCCALICFG_START_CYCLING_MASK)) {
-@@ -138,7 +139,11 @@
+@@ -138,7 +141,11 @@
  
      s->rtc.rtc_cali_cfg_timeout = value & ~(R_TIMG_RTCCALICFG2_TIMEOUT_MASK);
  
@@ -790,7 +1615,7 @@ diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
      {
          s->rtc.rtc_cali_cfg_timeout |= R_TIMG_RTCCALICFG2_TIMEOUT_MASK;
      }
-@@ -210,7 +215,7 @@
+@@ -210,7 +217,7 @@
          /* Avoid any divide-by-0 error in the code below */
          wdt->prescaler = 1;
      } else {
@@ -799,7 +1624,7 @@ diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
      }
  
      /* Recalculate the frequency out of the new prescaler and current clock */
-@@ -264,7 +269,7 @@
+@@ -264,7 +271,7 @@
      const bool enabled = FIELD_EX32(value, TIMG_WDTCONFIG0, EN) ? true : false;
      const bool enabled_changed = FIELD_EX32(former_conf, TIMG_WDTCONFIG0, EN) != enabled;
  
@@ -808,7 +1633,7 @@ diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
          /* If the prescaler value or the source clock changed update the timer */
          if ((FIELD_EX32(wdt->prescaler_mirror, TIMG_WDTCONFIG1, CLK_PRESCALE) != wdt->prescaler) ||
              (FIELD_EX32(former_conf, TIMG_WDTCONFIG0, USE_XTAL) != FIELD_EX32(value, TIMG_WDTCONFIG0, USE_XTAL)))
-@@ -278,11 +283,6 @@
+@@ -278,11 +285,6 @@
          wdt->stage_conf[2] = FIELD_EX32(value, TIMG_WDTCONFIG0, STG2);
          wdt->stage_conf[3] = FIELD_EX32(value, TIMG_WDTCONFIG0, STG3);
  
@@ -820,7 +1645,48 @@ diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
      }
  
      /* Check if the enabled bit changed */
-@@ -511,6 +511,9 @@
+@@ -316,13 +318,12 @@
+ }
+ 
+ 
+-static void esp_t0_cb(void* opaque)
++/* The alarm went off at the given time: the counter carries on counting from then */
++static void esp_t0_alarm(ESPT0State* t, int64_t at)
+ {
+-    ESPT0State* t = (ESPT0State*) opaque;
+-
+     /* Disable the alarm timer */
+     timer_del(&t->counter.timer);
+-    esp_virtual_counter_reenabled(&t->counter);
++    t->counter.base = at;
+ 
+     /* In practice, the counter is bigger than the requested value, this is due to the fact
+      * that there is a cost of emulation and the (Linux) kernel timer may also be busy
+@@ -342,6 +343,14 @@
+     }
+ }
+ 
++static void esp_t0_cb(void* opaque)
++{
++    ESPT0State* t = (ESPT0State*) opaque;
++
++    /* When it was due, not when this got to run, or every period would come out long */
++    esp_t0_alarm(t, t->counter.due);
++}
++
+ 
+ static void esp_t0_counter_flush(ESPT0State* t)
+ {
+@@ -383,7 +392,7 @@
+ 
+         if ((increase && (scenario1 || scenario3)) || (decrease && (scenario5 || scenario7))) {
+             /* The alarm was programmed too late, trigger an interrupt manually */
+-            esp_t0_cb(t);
++            esp_t0_alarm(t, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+         } else if ((increase && scenario2) || (decrease && scenario6)) {
+             /* The alarm is in range and in the future, program its trigger */
+             esp_virtual_counter_alarm_in_ticks(&t->counter, diff);
+@@ -511,6 +520,9 @@
          case A_TIMG_RTCCALICFG2:
              r = s->rtc.rtc_cali_cfg_timeout;
              break;
@@ -830,7 +1696,7 @@ diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
  
  
          /* Timer (T0) related registers */
-@@ -672,13 +675,21 @@
+@@ -672,13 +684,21 @@
              esp_wdt_update_config(&s->wdt, value);
              break;
          case A_TIMG_WDTCONFIG1:
@@ -854,7 +1720,7 @@ diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
              break;
          case A_TIMG_WDTFEED:
              esp_wdt_feed(&s->wdt);
-@@ -747,20 +758,75 @@
+@@ -747,20 +767,75 @@
  };
  
  
@@ -934,7 +1800,7 @@ diff -ruN a/hw/timer/esp_timg.c b/hw/timer/esp_timg.c
      s->wdt.prescaler = 1;
      s->wdt.raw_st = 0;
      s->wdt.int_enabled = 0;
-@@ -770,15 +836,16 @@
+@@ -770,15 +845,16 @@
      s->t0.raw_st = 0;
      s->t0.int_enabled = 0;
      s->t0.value_rel = 0;
@@ -1099,7 +1965,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
          xtensa_select_static_vectors(&s->cpu[1].env, s->rtc_cntl.stat_vector_sel[1]);
          remove_cpu_watchpoints(&s->cpu[1]);
          cpu_reset(CPU(&s->cpu[1]));
-@@ -225,8 +292,72 @@
+@@ -225,8 +292,93 @@
      s->requested_reset = 0;
  }
  
@@ -1149,6 +2015,27 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
 +    }
 +}
 +
++/*
++ * The RTC watchdog's last resort: the whole chip starts over, RTC domain and
++ * all, which also takes it off USB for a moment. Only its memory is as it was.
++ */
++static void esp32s3_rtc_reset(void *opaque, int n, int level)
++{
++    Esp32s3SocState *s = ESP32S3_SOC(opaque);
++
++    if (level) {
++        for (int i = 0; i < ESP32S3_CPU_COUNT; i++) {
++            s->rtc_cntl.reset_cause[i] = ESP32_RTCWDT_RTC_RESET;
++            s->rtc_cntl.stat_vector_sel[i] = true;
++        }
++        esp32s3_rtc_cntl_power_on(&s->rtc_cntl);
++        esp32s3_rtc_cntl_cancel_stall(&s->rtc_cntl);
++        artemis_usj_power_cycle(&s->usj);
++        s->requested_reset = ESP32S3_SOC_RESET_ALL;
++        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
++    }
++}
++
 +/* The watch's LDO: cutting it stops the chip, restoring it is a cold boot. */
 +static void esp32s3_board_power(void *opaque, int n, int level)
 +{
@@ -1159,7 +2046,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
 +            s->rtc_cntl.reset_cause[i] = ESP32_POWERON_RESET;
 +            s->rtc_cntl.stat_vector_sel[i] = true;
 +        }
-+        esp32s3_rtc_cntl_cancel_sleep(&s->rtc_cntl);
++        esp32s3_rtc_cntl_power_on(&s->rtc_cntl);
 +        esp32s3_rtc_cntl_cancel_stall(&s->rtc_cntl);
 +        esp32s3_gate_cores(s, false);
 +        s->requested_reset = ESP32S3_SOC_RESET_ALL;
@@ -1172,7 +2059,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
  }
  
  static void esp32s3_clk_update(void* opaque, int n, int level)
-@@ -236,6 +367,199 @@
+@@ -236,6 +388,220 @@
      }
  }
  
@@ -1328,6 +2215,27 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
 +    }
 +}
 +
++/*
++ * What a register access costs over one to memory, in CPU cycles, as timed on a
++ * watch: the RTC domain (and the eFuse block with it) is slow to reach, the
++ * registers beside the CPU quick, and writes are over sooner than reads.
++ */
++static uint32_t esp32s3_io_cost_milli;
++
++static uint32_t esp32s3_io_cost(uint64_t addr, bool is_write)
++{
++    uint32_t cycles;
++
++    if (addr >= DR_REG_EFUSE_BASE && addr < DR_REG_IO_MUX_BASE) {
++        cycles = is_write ? 30 : 60;
++    } else if (addr >= DR_REG_SYSTEM_BASE) {
++        cycles = is_write ? 3 : 9;
++    } else {
++        cycles = is_write ? 3 : 13;
++    }
++    return cycles * 1000 / esp32s3_io_cost_milli;
++}
++
 +/* Runs on the core concerned, so its helpers never see a half-made change. */
 +static void esp32s3_apply_cpu_hz(CPUState *cs, run_on_cpu_data data)
 +{
@@ -1372,7 +2280,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
  static void esp32s3_soc_add_periph_device(MemoryRegion *dest, void* dev, hwaddr dport_base_addr)
  {
      MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0);
-@@ -313,6 +637,148 @@
+@@ -313,6 +679,152 @@
      }
  }
  
@@ -1511,6 +2419,10 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
 +
 +    /* Both cores exist by now, so the clock block can start telling them their rate. */
 +    tcg_insn_pacing = ss->board.cycles_per_insn_milli != 0;
++    if (tcg_insn_pacing) {
++        esp32s3_io_cost_milli = ss->board.cycles_per_insn_milli;
++        tcg_insn_pace_io_cost = esp32s3_io_cost;
++    }
 +    ss->clock.cpu_hz_changed = esp32s3_cpu_hz_changed;
 +    ss->clock.cpu_hz_opaque = ss;
 +    ss->clock.periph_reset = esp32s3_periph_reset;
@@ -1521,8 +2433,14 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
  struct Esp32s3MachineState {
      MachineState parent;
  
-@@ -410,6 +876,8 @@
+@@ -408,8 +920,14 @@
+ 
+     qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32S3_RTC_DIG_RESET_GPIO, 0,
                                  qdev_get_gpio_in_named(dev, ESP32S3_RTC_DIG_RESET_GPIO, 0));
++    qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32S3_RTC_RTC_RESET_GPIO, 0,
++                                qdev_get_gpio_in_named(dev, ESP32S3_RTC_RTC_RESET_GPIO, 0));
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->rtc_cntl), 0,
++                       qdev_get_gpio_in(DEVICE(&s->intmatrix), ETS_RTC_CORE_INTR_SOURCE));
      qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32S3_RTC_CLK_UPDATE_GPIO, 0,
                                  qdev_get_gpio_in_named(dev, ESP32S3_RTC_CLK_UPDATE_GPIO, 0));
 +    qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32S3_RTC_SLEEP_STALL_GPIO, 0,
@@ -1530,7 +2448,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      for (int i = 0; i < ms->smp.cpus; ++i) {
          qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32S3_RTC_CPU_RESET_GPIO, i,
                                      qdev_get_gpio_in_named(dev, ESP32S3_RTC_CPU_RESET_GPIO, i));
-@@ -430,19 +898,6 @@
+@@ -430,19 +948,6 @@
      sysbus_connect_irq(SYS_BUS_DEVICE(&s->sdmmc), 0,
                         qdev_get_gpio_in(intmatrix_dev, ETS_SDIO_HOST_INTR_SOURCE));
  
@@ -1550,17 +2468,18 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      qemu_register_reset((QEMUResetHandler*) esp32s3_soc_reset, dev);
  
      /* TWAI realization */
-@@ -545,6 +1000,9 @@
+@@ -545,6 +1050,10 @@
  
      qdev_init_gpio_in_named(DEVICE(s), esp32s3_dig_reset,  ESP32S3_RTC_DIG_RESET_GPIO, 1);
      qdev_init_gpio_in_named(DEVICE(s), esp32s3_cpu_reset,  ESP32S3_RTC_CPU_RESET_GPIO, ESP32S3_CPU_COUNT);
++    qdev_init_gpio_in_named(DEVICE(s), esp32s3_rtc_reset,  ESP32S3_RTC_RTC_RESET_GPIO, 1);
 +    qdev_init_gpio_in_named(DEVICE(s), esp32s3_sleep_stall, ESP32S3_RTC_SLEEP_STALL_GPIO, 1);
 +    qdev_init_gpio_in_named(DEVICE(s), esp32s3_board_power, "board-power", 1);
 +    qdev_init_gpio_in_named(DEVICE(s), esp32s3_timg_wdt_reset, "timg-wdt-reset", 2);
      qdev_init_gpio_in_named(DEVICE(s), esp32s3_cpu_stall,  ESP32S3_RTC_CPU_STALL_GPIO, ESP32S3_CPU_COUNT);
      qdev_init_gpio_in_named(DEVICE(s), esp32s3_clk_update, ESP32S3_RTC_CLK_UPDATE_GPIO, 1);
  
-@@ -592,14 +1050,6 @@
+@@ -592,14 +1101,6 @@
  
  // -----------------------------------------------
  
@@ -1575,7 +2494,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
  static void esp32s3_machine_init(MachineState *machine)
  {
      DriveInfo *dinfo = drive_get(IF_MTD, 0, 0);
-@@ -625,9 +1075,10 @@
+@@ -625,9 +1126,10 @@
      memory_region_add_subregion(sys_mem, memmap[ESP32S3_MEMREGION_DRAM].base, dram);
  
  
@@ -1588,7 +2507,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
  
      // qdev_prop_set_chr(DEVICE(ss), "serial0", serial_hd(0));
      // qdev_prop_set_chr(DEVICE(ss), "serial1", serial_hd(1));
-@@ -638,8 +1089,19 @@
+@@ -638,8 +1140,19 @@
      object_initialize_child(OBJECT(ss), "extmem", &ss->cache, TYPE_ESP32S3_CACHE);
      object_initialize_child(OBJECT(ss), "spi1", &ss->spi1, TYPE_ESP32S3_SPI);
      object_initialize_child(OBJECT(ss), "efuse", &ss->efuse, TYPE_ESP32S3_EFUSE);
@@ -1610,7 +2529,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      object_initialize_child(OBJECT(ss), "rng", &ss->rng, TYPE_ESP32S3_RNG);
  
      object_initialize_child(OBJECT(ss), "clock", &ss->clock, TYPE_ESP32S3_CLOCK);
-@@ -668,13 +1130,6 @@
+@@ -668,13 +1181,6 @@
      /* Initialize OpenCores Ethernet controller now sicne it requires the interrupt matrix */
      esp32s3_init_openeth(ss);
  
@@ -1624,7 +2543,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      /* SPI1 controller (SPI Flash) */
      {
          ss->spi1.xts_aes = &ss->xts_aes;
-@@ -740,6 +1195,8 @@
+@@ -740,6 +1246,8 @@
          /* Connect the Watchdog interrupt line to the interrupt matrix */
          qdev_connect_gpio_out_named(DEVICE(&ss->timg[0]), ESP32S3_WDT_IRQ_INTERRUPT, 0,
                                      qdev_get_gpio_in(intmatrix_dev, ETS_TG0_WDT_LEVEL_INTR_SOURCE));
@@ -1633,7 +2552,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      }
      {
          sysbus_realize(SYS_BUS_DEVICE(&ss->timg[1]), &error_fatal);
-@@ -754,6 +1211,8 @@
+@@ -754,6 +1262,8 @@
          /* Connect the Watchdog interrupt line to the interrupt matrix */
          qdev_connect_gpio_out_named(DEVICE(&ss->timg[1]), ESP32S3_WDT_IRQ_INTERRUPT, 0,
                                      qdev_get_gpio_in(intmatrix_dev, ETS_TG1_WDT_LEVEL_INTR_SOURCE));
@@ -1642,7 +2561,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      }
  
      /* System timer */
-@@ -768,13 +1227,6 @@
+@@ -768,13 +1278,6 @@
      }
  
  
@@ -1656,7 +2575,7 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
      {
          qdev_realize(DEVICE(&ss->rng), &ss->periph_bus, &error_fatal);
          esp32s3_soc_add_periph_device(sys_mem, &ss->rng, ESP32S3_RNG_BASE);
-@@ -784,7 +1236,8 @@
+@@ -784,7 +1287,8 @@
  
      /* GDMA Realization */
      {
@@ -1666,7 +2585,21 @@ diff -ruN a/hw/xtensa/esp32s3.c b/hw/xtensa/esp32s3.c
          sysbus_realize(SYS_BUS_DEVICE(&ss->gdma), &error_fatal);
          MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->gdma), 0);
          memory_region_add_subregion_overlap(sys_mem, DR_REG_GDMA_BASE, mr, 0);
-@@ -869,8 +1322,7 @@
+@@ -824,11 +1328,10 @@
+         sysbus_connect_irq(SYS_BUS_DEVICE(&ss->rsa), 0,
+                            qdev_get_gpio_in(intmatrix_dev, ETS_RSA_INTR_SOURCE));
+     }
+-    /* PMS realization */
++    /* PMS realization: left unmapped, so that its registers get the plain storage that
++     * knows what they reset to */
+     {
+         sysbus_realize(SYS_BUS_DEVICE(&ss->pms), &error_fatal);
+-        MemoryRegion *mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(&ss->pms), 0);
+-        memory_region_add_subregion_overlap(sys_mem, DR_REG_SENSITIVE_BASE, mr, 0);
+     }
+ 
+     /* HMAC realization */
+@@ -869,8 +1372,7 @@
          memory_region_add_subregion_overlap(sys_mem, esp32s3_memmap[ESP32S3_MEMREGION_FRAMEBUF].base, &ss->rgb.vram, 0);
      }
  
@@ -1952,10 +2885,43 @@ diff -ruN a/hw/xtensa/esp32s3_intc.c b/hw/xtensa/esp32s3_intc.c
      for (int i = 0; i < ESP32S3_CPU_COUNT; ++i) {
          if (s->outputs[i] == NULL) {
              continue;
+diff -ruN a/include/hw/char/esp32s3_uart.h b/include/hw/char/esp32s3_uart.h
+--- a/include/hw/char/esp32s3_uart.h
++++ b/include/hw/char/esp32s3_uart.h
+@@ -19,6 +19,8 @@
+     ESP32UARTState parent;
+ 
+     uint32_t conf1;
++    /* Source clock and its divider: where the ESP32 has its date register */
++    uint32_t clk_conf;
+ } ESP32S3UARTState;
+ 
+ typedef struct ESP32S3UARTClass {
+@@ -28,6 +30,7 @@
+      * by device_class_set_parent_* functions. They can then be called in the
+      * respective class methods: realize. */
+     DeviceRealize parent_realize;
++    ResettablePhases parent_phases;
+ 
+     /* Virtual attributes/methods overriden */
+     void (*parent_uart_write)(void *opaque, hwaddr addr, uint64_t value, unsigned int size);
+diff -ruN a/include/hw/char/esp32_uart.h b/include/hw/char/esp32_uart.h
+--- a/include/hw/char/esp32_uart.h
++++ b/include/hw/char/esp32_uart.h
+@@ -85,6 +85,9 @@
+     qemu_irq irq;
+     QEMUTimer throttle_timer;
+     QEMUTimer rx_timeout_timer;
++    /* Sends the transmit FIFO a character at a time, at the baud rate */
++    QEMUTimer tx_timer;
++    int64_t tx_due;
+     bool throttle_rx;
+     bool rxfifo_tout;
+     unsigned baud_rate;
 diff -ruN a/include/hw/core/cpu.h b/include/hw/core/cpu.h
 --- a/include/hw/core/cpu.h
 +++ b/include/hw/core/cpu.h
-@@ -366,8 +366,21 @@
+@@ -366,8 +366,31 @@
  #endif
      IcountDecr icount_decr;
      bool can_do_io;
@@ -1965,25 +2931,36 @@ diff -ruN a/include/hw/core/cpu.h b/include/hw/core/cpu.h
  
 +/*
 + * Instruction pacing: a CPU that executes faster than the given time per
-+ * instruction waits for the clock to catch up, in slices short enough not to
-+ * show in interrupt latency. It leaves idle time alone and never makes up for
-+ * a host that is too slow.
++ * instruction waits for the VM clock to catch up, in slices short enough not
++ * to show in interrupt latency. It leaves idle time alone. What the host does
++ * on the guest's behalf that costs the real machine nothing, translating code
++ * and running device models, happens with the VM clock stopped, so the guest
++ * sees its code take the time the instructions account for and no more.
 + */
 +/* Whether translated code keeps count; fixed before the first translation. */
 +extern bool tcg_insn_pacing;
 +/* Picoseconds each instruction should take; 0 lets the CPUs run freely. */
 +extern uint32_t tcg_insn_pace_ps;
++/* How many instructions' time a device register access takes, if the machine says. */
++extern uint32_t (*tcg_insn_pace_io_cost)(uint64_t addr, bool is_write);
++/*
++ * How far, in nanoseconds, the instructions the calling CPU has run are ahead of
++ * the VM clock: it runs each slice in one go and then waits. A clock the guest
++ * reads should have this added, so that it moves with the instructions.
++ */
++int64_t tcg_insn_pace_ahead(void);
 +
  struct KVMState;
  struct kvm_run;
  
-@@ -493,6 +506,9 @@
+@@ -493,6 +516,10 @@
      uint32_t interrupt_request;
      int singlestep_enabled;
      int64_t icount_budget;
-+    /* Host time by which the instructions run so far should have finished. */
++    /* Time on the VM clock by which the instructions run so far should have finished. */
 +    int64_t insn_pace_due;
 +    bool insn_pace_started;
++    bool holds_clock;
      int64_t icount_extra;
      uint64_t random_seed;
      sigjmp_buf jmp_env;
@@ -2027,15 +3004,18 @@ diff -ruN a/include/hw/dma/esp_gdma.h b/include/hw/dma/esp_gdma.h
 diff -ruN a/include/hw/misc/esp32s3_rtc_cntl.h b/include/hw/misc/esp32s3_rtc_cntl.h
 --- a/include/hw/misc/esp32s3_rtc_cntl.h
 +++ b/include/hw/misc/esp32s3_rtc_cntl.h
-@@ -22,6 +22,7 @@
+@@ -20,8 +20,10 @@
+ 
+ #define ESP32S3_RTC_DIG_RESET_GPIO    "dig-reset"
  #define ESP32S3_RTC_CPU_RESET_GPIO    "cpu-reset"
++#define ESP32S3_RTC_RTC_RESET_GPIO    "rtc-reset"
  #define ESP32S3_RTC_CPU_STALL_GPIO    "cpu-stall"
  #define ESP32S3_RTC_CLK_UPDATE_GPIO   "clk-update"
 +#define ESP32S3_RTC_SLEEP_STALL_GPIO  "sleep-stall"
  
  typedef enum Esp32s3ResetCause {
      ESP32_POWERON_RESET = 1,
-@@ -58,6 +59,8 @@
+@@ -58,6 +60,8 @@
      ESP32_SLOW_CLK_8MD256 = 2
  } Esp32s3SlowClkSel;
  
@@ -2044,7 +3024,7 @@ diff -ruN a/include/hw/misc/esp32s3_rtc_cntl.h b/include/hw/misc/esp32s3_rtc_cnt
  typedef struct Esp32s3RtcCntlState {
      SysBusDevice parent_obj;
  
-@@ -67,8 +70,16 @@
+@@ -67,8 +71,27 @@
      qemu_irq cpu_reset_req[ESP32S3_CPU_COUNT];
      qemu_irq cpu_stall_req[ESP32S3_CPU_COUNT];
      qemu_irq clk_update;
@@ -2058,10 +3038,21 @@ diff -ruN a/include/hw/misc/esp32s3_rtc_cntl.h b/include/hw/misc/esp32s3_rtc_cnt
 +    bool sleeping;
 +    bool deep_sleep;
 +
++    /* The RTC watchdog: which stage it is in, since when, and how far in when it was paused */
++    QEMUTimer *wdt_timer;
++    int wdt_stage;
++    int64_t wdt_stage_start;
++    int64_t wdt_paused_after;
++    bool wdt_disable;
++    qemu_irq rtc_reset_req;
++    bool started;
++    /* RESET_STATE's note, per core, that a reset has happened since it was last cleared */
++    uint32_t reset_flags;
++
      uint32_t xtal_apb_freq;
      uint32_t pll_apb_freq;
      Esp32s3SocClkSel soc_clk;
-@@ -126,3 +137,10 @@
+@@ -126,3 +149,12 @@
  REG32(RTC_CNTL_DATE,   0x1fc)
  
  #define ESP32S3_RTC_CNTL_SIZE (A_RTC_CNTL_DATE + 4)
@@ -2070,6 +3061,8 @@ diff -ruN a/include/hw/misc/esp32s3_rtc_cntl.h b/include/hw/misc/esp32s3_rtc_cnt
 +void esp32s3_rtc_cntl_wake_check(void *opaque);
 +/* Forget a sleep in progress, for when power was cut during it. */
 +void esp32s3_rtc_cntl_cancel_sleep(Esp32s3RtcCntlState *s);
++/* Everything in the RTC domain back to how power-on leaves it. */
++void esp32s3_rtc_cntl_power_on(Esp32s3RtcCntlState *s);
 +/* A system reset releases cores that firmware had stalled. */
 +void esp32s3_rtc_cntl_cancel_stall(Esp32s3RtcCntlState *s);
 diff -ruN a/include/hw/timer/esp_systimer.h b/include/hw/timer/esp_systimer.h
@@ -2095,8 +3088,13 @@ diff -ruN a/include/hw/timer/esp_systimer.h b/include/hw/timer/esp_systimer.h
 diff -ruN a/include/hw/timer/esp_timg.h b/include/hw/timer/esp_timg.h
 --- a/include/hw/timer/esp_timg.h
 +++ b/include/hw/timer/esp_timg.h
-@@ -48,7 +48,7 @@
- #define ESP_RC_SLOW_FREQ        136000
+@@ -45,10 +45,11 @@
+  */
+ #define ESP_APB_CLK             80000000UL
+ #define ESP_XTAL_CLK            40000000UL
+-#define ESP_RC_SLOW_FREQ        136000
++/* 136 kHz nominally; this is what a watch's runs at, by its own calibration */
++#define ESP_RC_SLOW_FREQ        150600
  #define ESP_RC_FAST_FREQ        17500000
  #define ESP_RC_FAST_DIV_FREQ    (ESP_RC_FAST_FREQ / 256)
 -#define ESP_XTAL32K_FREQ        32000
@@ -2104,7 +3102,16 @@ diff -ruN a/include/hw/timer/esp_timg.h b/include/hw/timer/esp_timg.h
  
  
  /**
-@@ -158,8 +158,14 @@
+@@ -86,6 +87,8 @@
+     uint64_t value;
+     /* Time when the value was last updated */
+     uint64_t base;
++    /* Time the alarm was set for, which is a little before its callback gets to run */
++    int64_t due;
+     /* Frequency, in Hz, of the timer */
+     uint64_t frequency;
+ } ESPVirtualCounter;
+@@ -158,8 +161,14 @@
  
      /* Property used to disable the watchdog from command line */
      bool wdt_disable;
@@ -2163,6 +3170,136 @@ diff -ruN a/include/hw/xtensa/esp32s3_intc.h b/include/hw/xtensa/esp32s3_intc.h
  
      /* properties */
      XtensaCPU *cpu[ESP32S3_CPU_COUNT];
+diff -ruN a/include/sysemu/cpu-timers.h b/include/sysemu/cpu-timers.h
+--- a/include/sysemu/cpu-timers.h
++++ b/include/sysemu/cpu-timers.h
+@@ -94,6 +94,10 @@
+  */
+ int64_t cpu_get_clock(void);
+ 
++/* Stops the VM clock until the matching release; see cpu-timers.c */
++void cpu_clock_hold(void);
++void cpu_clock_release(void);
++
+ void qemu_timer_notify_cb(void *opaque, QEMUClockType type);
+ 
+ /* get/set VIRTUAL clock and VM elapsed ticks via the cpus accel interface */
+diff -ruN a/system/cpus.c b/system/cpus.c
+--- a/system/cpus.c
++++ b/system/cpus.c
+@@ -42,6 +42,8 @@
+ #include "sysemu/replay.h"
+ #include "sysemu/runstate.h"
+ #include "sysemu/cpu-timers.h"
++#include "qemu/timer.h"
++#include "qemu/processor.h"
+ #include "sysemu/whpx.h"
+ #include "hw/boards.h"
+ #include "hw/hw.h"
+@@ -450,6 +452,39 @@
+     process_queued_cpu_work(cpu);
+ }
+ 
++/*
++ * With instruction pacing a halted CPU is to take its interrupts when they are due,
++ * and a thread that is asleep takes a tenth of a millisecond or more to wake. So it
++ * sleeps only until shortly before the VM clock's next timer, then stays awake for
++ * it and runs it itself.
++ */
++#define IDLE_WAKE_EARLY_NS  (120 * SCALE_US)
++
++static void qemu_wait_while_idle(CPUState *cpu)
++{
++    int64_t left = tcg_insn_pacing ?
++                   qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL, QEMU_TIMER_ATTR_ALL) : -1;
++
++    if (left < 0) {
++        qemu_cond_wait(cpu->halt_cond, &bql);
++    } else if (left > IDLE_WAKE_EARLY_NS) {
++        struct timespec until;
++
++        clock_gettime(CLOCK_MONOTONIC, &until);
++        left += until.tv_nsec - IDLE_WAKE_EARLY_NS;
++        until.tv_sec += left / NANOSECONDS_PER_SECOND;
++        until.tv_nsec = left % NANOSECONDS_PER_SECOND;
++        pthread_cond_timedwait(&cpu->halt_cond->cond, &bql.lock, &until);
++    } else {
++        bql_unlock();
++        while (!qemu_clock_expired(QEMU_CLOCK_VIRTUAL) && cpu_thread_is_idle(cpu)) {
++            cpu_relax();
++        }
++        bql_lock();
++        qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
++    }
++}
++
+ void qemu_wait_io_event(CPUState *cpu)
+ {
+     bool slept = false;
+@@ -459,7 +494,7 @@
+             slept = true;
+             qemu_plugin_vcpu_idle_cb(cpu);
+         }
+-        qemu_cond_wait(cpu->halt_cond, &bql);
++        qemu_wait_while_idle(cpu);
+     }
+     if (slept) {
+         qemu_plugin_vcpu_resume_cb(cpu);
+diff -ruN a/system/cpu-timers.c b/system/cpu-timers.c
+--- a/system/cpu-timers.c
++++ b/system/cpu-timers.c
+@@ -70,19 +70,50 @@
+     return ticks;
+ }
+ 
++/* How many CPUs are holding the clock still, and the host time it stopped at. */
++static int clock_holds;
++static int64_t clock_held_at;
++
+ int64_t cpu_get_clock_locked(void)
+ {
+     int64_t time;
+ 
+     time = timers_state.cpu_clock_offset;
+     if (timers_state.cpu_ticks_enabled) {
+-        time += get_clock();
++        time += clock_holds ? clock_held_at : get_clock();
+     }
+ 
+     return time;
+ }
+ 
+ /*
++ * The clock stands still between a hold and its release: for work the host does
++ * on the guest's behalf that takes the real machine no time, like translating
++ * code. Holds from several CPUs overlap.
++ */
++void cpu_clock_hold(void)
++{
++    seqlock_write_lock(&timers_state.vm_clock_seqlock,
++                       &timers_state.vm_clock_lock);
++    if (clock_holds++ == 0) {
++        clock_held_at = get_clock();
++    }
++    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
++                         &timers_state.vm_clock_lock);
++}
++
++void cpu_clock_release(void)
++{
++    seqlock_write_lock(&timers_state.vm_clock_seqlock,
++                       &timers_state.vm_clock_lock);
++    if (--clock_holds == 0 && timers_state.cpu_ticks_enabled) {
++        timers_state.cpu_clock_offset -= get_clock() - clock_held_at;
++    }
++    seqlock_write_unlock(&timers_state.vm_clock_seqlock,
++                         &timers_state.vm_clock_lock);
++}
++
++/*
+  * Return the monotonic time elapsed in VM, i.e.,
+  * the time between vm_start and vm_stop
+  */
 diff -ruN a/system/physmem.c b/system/physmem.c
 --- a/system/physmem.c
 +++ b/system/physmem.c
@@ -2191,3 +3328,15 @@ diff -ruN a/system/physmem.c b/system/physmem.c
      notifier->active = false;
      /* We leave the notifier struct on the list to avoid reallocating it later.
       * Generally the number of IOMMUs a CPU deals with will be small.
+diff -ruN a/target/xtensa/op_helper.c b/target/xtensa/op_helper.c
+--- a/target/xtensa/op_helper.c
++++ b/target/xtensa/op_helper.c
+@@ -39,7 +39,7 @@
+ void HELPER(update_ccount)(CPUXtensaState *env)
+ {
+     XtensaCPU *cpu = env_archcpu(env);
+-    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + tcg_insn_pace_ahead();
+ 
+     env->ccount_time = now;
+     env->sregs[CCOUNT] = env->ccount_base +

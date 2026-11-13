@@ -34,6 +34,8 @@
 
 #define TSENS_OUT_M     0xFF
 #define TSENS_READY     BIT(8)
+#define TSENS_POWER_UP  BIT(22)
+#define TSENS_DUMP_OUT  BIT(24)
 /* About 30 C through the driver's conversion at the default range. */
 #define TSENS_READING   115
 
@@ -75,7 +77,11 @@ static uint64_t saradc_read(void *opaque, hwaddr addr, unsigned size)
     if (addr == A_SAR_SLAVE_ADDR1) {
         v &= ~MEAS_STATUS_M;
     } else if (addr == A_SAR_TSENS_CTRL) {
-        v = (v & ~TSENS_OUT_M) | TSENS_READY | TSENS_READING;
+        /* A reading appears once the sensor is powered and asked for one. */
+        v &= ~(TSENS_OUT_M | TSENS_READY);
+        if ((v & TSENS_POWER_UP) && (v & TSENS_DUMP_OUT)) {
+            v |= TSENS_READY | TSENS_READING;
+        }
     } else if (addr == A_TOUCH_CHN_ST) {
         v |= TOUCH_MEAS_DONE;
     } else if (addr >= A_TOUCH_STATUS1 && addr <= A_TOUCH_STATUS14) {

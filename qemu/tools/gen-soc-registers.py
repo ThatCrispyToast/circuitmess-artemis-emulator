@@ -27,12 +27,23 @@ BLOCKS = [
     ("usb_wrap_reg.h", "DR_REG_USB_WRAP_BASE", [0x60039000]),
     ("peri_backup_reg.h", "DR_REG_PERI_BACKUP_BASE", [0x6002A000]),
     ("sensitive_reg.h", "DR_REG_SENSITIVE_BASE", [0x600C1000]),
+    ("extmem_reg.h", "DR_REG_EXTMEM_BASE", [0x600C4000]),
     ("assist_debug_reg.h", "DR_REG_ASSIST_DEBUG_BASE", [0x600CE000]),
     ("world_controller_reg.h", "DR_REG_WORLD_CNTL_BASE", [0x600D0000]),
 ]
 
 # Fields firmware can set and read back. Self-clearing and write-only ones read as 0.
-STORED = {"R/W", "R/W/SS"}
+STORED = {"R/W", "RW", "R/W/SS"}
+# Fields that can't be read have no value out of reset either.
+UNREADABLE = {"WO", "WT", "WOD"}
+
+# Bits the headers call read/write that don't take writes on a watch.
+READ_ONLY = {
+    0x60003018: 0x50000000,
+    0x60003024: 0xffffffff,
+    0x60003028: 0xffffffff,
+    0x60003034: 0xffffffff,
+}
 
 # Where a watch's registers, read back after it had booted, differ from what the
 # headers say they reset to: the silicon is the authority, so these win.
@@ -46,6 +57,8 @@ MEASURED = {
     0x60003020: 0x700000eb,
     0x60003034: 0x00000000,
     0x60003038: 0x00000000,
+    0x60003024: 0x00000000,
+    0x60003028: 0x00000000,
     0x6000303c: 0x00000005,
     0x60003098: 0x00000000,
     0x600030a0: 0x00000000,
@@ -53,6 +66,7 @@ MEASURED = {
     0x600030e0: 0x00000000,
     0x600030e8: 0x00000000,
     0x600030f8: 0x00000004,
+    0x60008018: 0x20000000,
     0x6000801c: 0x14094143,
     0x60008024: 0x02010201,
     0x60008028: 0x02010201,
@@ -60,6 +74,7 @@ MEASURED = {
     0x60008030: 0x02010201,
     0x60008034: 0x00400000,
     0x6000803c: 0x00040000,
+    0x60008044: 0x00020000,
     0x60008060: 0x00076e80,
     0x60008068: 0xc0000000,
     0x60008080: 0x003bc800,
@@ -67,10 +82,6 @@ MEASURED = {
     0x60008088: 0x00100000,
     0x6000808c: 0x0000f000,
     0x60008090: 0xc0020000,
-    0x60008098: 0x4007ee00,
-    0x6000809c: 0x000956a0,
-    0x600080a0: 0x00021340,
-    0x600080b0: 0x00000000,
     0x600080b8: 0x00000000,
     0x600080d0: 0x08150730,
     0x600080d4: 0x02719100,
@@ -82,7 +93,9 @@ MEASURED = {
     0x60008148: 0x00000000,
     0x6000814c: 0x000000fc,
     0x60008150: 0xfc000000,
-    0x6000885c: 0xfffc7fff,
+    0x60008804: 0x20000000,
+    0x6000885c: 0xfff47fff,
+    0x600088e4: 0x70000000,
     0x60017000: 0x00003c10,
     0x6001700c: 0x00003c10,
     0x60017018: 0x00003c10,
@@ -94,17 +107,19 @@ MEASURED = {
     0x60026098: 0x80000000,
     0x6002609c: 0x00000040,
     0x60039000: 0x00000000,
+    0x600c4144: 0x00000009,
     0x600ce010: 0x03fffff0,
     0x600ce018: 0x03fffff0,
     0x600ce020: 0xffffffff,
     0x600ce028: 0xffffffff,
+    0x600ce030: 0x00000000,
     0x600ce038: 0x0000000b,
     0x600ce040: 0xffffffff,
 }
 
 REGISTER = re.compile(r"#define\s+(\w+_REG)(?:\(i\))?\s+\((.+?)\s*\+\s*(0x[0-9A-Fa-f]+|\d+)\s*\)")
 FIELD = re.compile(r"/\*+\s*(\w+)\s*:\s*([\w/]+)\s*;\s*bitpos:\s*\[(\d+)(?::(\d+))?\]\s*;\s*default:\s*"
-                   r"(?:(\d+)'([bhd]))?\s*([0-9a-fA-FxX]+)")
+                   r"(~)?\s*(?:(\d+)'([bhd]))?\s*([0-9a-fA-FxX]+)")
 
 
 def parse(path: Path, base: str):
@@ -121,7 +136,7 @@ def parse(path: Path, base: str):
             continue
         match = FIELD.match(line.strip())
         if match and current:
-            _, access, high, low, _, radix, value = match.groups()
+            _, access, high, low, inverted, _, radix, value = match.groups()
             high = int(high)
             low = int(low) if low is not None else high
             mask = ((1 << (high - low + 1)) - 1) << low
@@ -129,7 +144,10 @@ def parse(path: Path, base: str):
                 number = int(value, 16)
             else:
                 number = int(value, {"b": 2, "h": 16, "d": 10, None: 10}[radix])
-            current[2] |= (number << low) & mask & 0xFFFFFFFF
+            if inverted:
+                number = ~number
+            if access not in UNREADABLE:
+                current[2] |= (number << low) & mask & 0xFFFFFFFF
             if access in STORED:
                 current[3] |= mask
     return registers
@@ -156,6 +174,7 @@ def main():
                     continue
                 seen.add(offset)
                 reset = measured.pop(address + offset, reset)
+                writable &= ~READ_ONLY.get(address + offset, 0)
                 print(f"    {{ {address + offset:#010x}, {reset:#010x}, {writable:#010x} }},")
                 count += 1
     if measured:

@@ -104,6 +104,9 @@ bool artemis_ledc_channel_level(ArtemisLedcState *s, int ch);
 OBJECT_DECLARE_SIMPLE_TYPE(ArtemisGpioState, ARTEMIS_GPIO)
 
 #define ARTEMIS_GPIO_EXT_FLOATING (-1)
+/* Held through a resistance large enough that the pad's own pull wins over it. */
+#define ARTEMIS_GPIO_EXT_WEAK_HIGH (-2)
+#define ARTEMIS_GPIO_EXT_WEAK_LOW (-3)
 
 /* Fired for pins whose visible output changed; level is a fraction of 65535. */
 typedef void (*ArtemisPinNotify)(void *opaque, int pin, uint32_t level,
@@ -136,6 +139,7 @@ struct ArtemisGpioState {
     int8_t ext[ARTEMIS_GPIO_COUNT];
     uint64_t level;
     uint64_t driving;
+    uint64_t pulling;
     bool in_drive_notify;
     uint32_t published_level[ARTEMIS_GPIO_COUNT];
     uint32_t published_freq[ARTEMIS_GPIO_COUNT];
@@ -159,6 +163,8 @@ void artemis_gpio_set_external(ArtemisGpioState *s, int pin, int level);
 bool artemis_gpio_get_level(ArtemisGpioState *s, int pin);
 /* Whether the pad's output driver is enabled. */
 bool artemis_gpio_is_output(ArtemisGpioState *s, int pin);
+/* The pad's own pull: 1 up, -1 down, 0 neither. */
+int artemis_gpio_pull(ArtemisGpioState *s, int pin);
 /* Recomputes and republishes PWM-driven pads; called when LEDC changes. */
 void artemis_gpio_refresh_outputs(ArtemisGpioState *s);
 /* Forces every visible pad to be published again, e.g. for a new UI client. */

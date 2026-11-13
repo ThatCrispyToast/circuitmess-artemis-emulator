@@ -65,7 +65,8 @@ def test_level_bubble_follows_the_tilt(watch):
 
     watch.set_motion(accel_g=(0.5, 0.0, 0.87))
     watch.wait_until(lambda: bubble_centre() and bubble_centre()[0] < 50, timeout=3)
-    assert watch.rgb_led[1] < 0.01
+    # The program draws first and sets the LED after.
+    watch.wait_until(lambda: watch.rgb_led[1] < 0.01, timeout=1)
 
 
 def test_clock_shows_the_rtc_on_the_leds(watch):

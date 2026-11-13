@@ -21,6 +21,10 @@
 
 #define POLL_THRESHOLD 16
 
+/* In the Wi-Fi MAC: the transmitter's state, which a watch reads as idle. */
+#define MAC_TX_STATUS     0x60033D14
+#define MAC_TX_IDLE       1
+
 
 static const struct {
     hwaddr base;
@@ -54,6 +58,9 @@ static uint64_t radio_read(void *opaque, hwaddr addr, unsigned size)
     RadioWindow *w = opaque;
     ArtemisRadioState *s = w->radio;
 
+    if (w->base + addr == MAC_TX_STATUS) {
+        return MAC_TX_IDLE;
+    }
     if (s->last_read == w->base + addr) {
         if (++s->repeats >= POLL_THRESHOLD) {
             return (s->repeats & 1) ? UINT32_MAX : 0;
@@ -62,6 +69,8 @@ static uint64_t radio_read(void *opaque, hwaddr addr, unsigned size)
         s->last_read = w->base + addr;
         s->repeats = 0;
     }
+    qemu_log_mask(LOG_UNIMP, "radio: read %08" HWADDR_PRIx " = %08x\n",
+                  w->base + addr, w->regs[addr / 4]);
     return w->regs[addr / 4];
 }
 
@@ -70,6 +79,8 @@ static void radio_write(void *opaque, hwaddr addr, uint64_t value, unsigned size
     RadioWindow *w = opaque;
 
     w->radio->last_read = 0;
+    qemu_log_mask(LOG_UNIMP, "radio: write %08" HWADDR_PRIx " = %08x\n",
+                  w->base + addr, (uint32_t)value);
 
     /* The analog I2C master's command registers latch a busy bit: never set. */
     if (w->base + addr >= ANA_I2C_CMD_START && w->base + addr < ANA_I2C_CMD_END) {

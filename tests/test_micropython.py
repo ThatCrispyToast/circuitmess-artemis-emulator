@@ -275,8 +275,10 @@ def test_leds_light_one_at_a_time(micropython):
 
 
 def test_led_brightness_follows_pwm(micropython):
+    watch = micropython.watch
     micropython.run("from machine import Pin, PWM\npwm = PWM(Pin(46), freq=1000, duty_u16=16384)")
-    assert micropython.watch.leds[0] == pytest.approx(0.25, abs=0.01)
+    # The driver starts the channel at half and the duty asked for follows a period later.
+    watch.wait_until(lambda: watch.leds[0] == pytest.approx(0.25, abs=0.01), timeout=1)
 
 
 def test_rgb_led_mixes_channels(micropython):

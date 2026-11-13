@@ -271,7 +271,8 @@ class Watch:
             "-global", f"driver=artemis.board,property=charging,value={'on' if self.charging else 'off'}",
         ]
         if not self.watchdogs:
-            args += ["-global", "driver=timer.esp.timg,property=wdt_disable,value=on"]
+            args += ["-global", "driver=timer.esp.timg,property=wdt_disable,value=on",
+                     "-global", "driver=misc.esp32s3.rtc_cntl,property=wdt_disable,value=on"]
         if self.turbo:
             # Code then runs as fast as this computer manages, not at the watch's speed.
             args += ["-global", "driver=artemis.board,property=cycles-per-insn-milli,value=0"]

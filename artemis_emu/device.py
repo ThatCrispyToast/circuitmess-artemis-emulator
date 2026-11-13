@@ -254,7 +254,7 @@ class Device:
         if not binary:
             raise DeviceError("esptool wasn't found: run through `nix run` or `nix develop`")
         was_open = self.usb_port is not None
-        self.port = self.port or self._resolve_port()
+        self.port = self._resolve_port()
         self.close()
 
         # esptool's own reset at the end only works if it also did the one at the start,

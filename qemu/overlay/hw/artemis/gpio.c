@@ -105,6 +105,12 @@ static const struct {
     { ARTEMIS_PIN_BUTTON, 0 },
     { ARTEMIS_PIN_USB_DETECT, 0 },
     { ARTEMIS_PIN_POWEROFF, 1 },
+    /* An LED passes nothing below its forward voltage, so leakage lifts its pad. */
+    { ARTEMIS_PIN_LED5, ARTEMIS_GPIO_EXT_WEAK_HIGH },
+    { ARTEMIS_PIN_LED6, ARTEMIS_GPIO_EXT_WEAK_HIGH },
+    /* The RGB LED's anode is on the supply: the red one drops little enough to read high. */
+    { ARTEMIS_PIN_RGB_R, ARTEMIS_GPIO_EXT_WEAK_HIGH },
+    { ARTEMIS_PIN_TFT_SDA, ARTEMIS_GPIO_EXT_WEAK_HIGH },
     { 26, 1 }, { 27, 1 }, { 28, 0 }, { 29, 1 }, { 30, 0 }, { 31, 1 }, { 32, 1 },
 };
 
@@ -204,7 +210,7 @@ static bool pin_undriven_level(ArtemisGpioState *s, int pin)
 {
     uint32_t mux = s->iomux[pin];
 
-    if (s->ext[pin] != ARTEMIS_GPIO_EXT_FLOATING) {
+    if (s->ext[pin] >= 0) {
         return s->ext[pin];
     }
     if (mux & MUX_FUN_PU) {
@@ -212,6 +218,9 @@ static bool pin_undriven_level(ArtemisGpioState *s, int pin)
     }
     if (mux & MUX_FUN_PD) {
         return false;
+    }
+    if (s->ext[pin] != ARTEMIS_GPIO_EXT_FLOATING) {
+        return s->ext[pin] == ARTEMIS_GPIO_EXT_WEAK_HIGH;
     }
     return s->level >> pin & 1;
 }
@@ -369,27 +378,38 @@ static void update_pads(ArtemisGpioState *s)
         s->wake_notify(s->wake_notify_opaque);
     }
 
-    /* The board reacts to what the chip drives, not only to levels. */
-    uint64_t driving = 0;
+    /* The board reacts to what the chip drives and pulls, not only to levels. */
+    uint64_t driving = 0, pulling = 0;
     for (int i = 0; i < 49; i++) {
         if (pin_output_enabled(s, i)) {
             driving |= 1ULL << i;
         }
+        if (artemis_gpio_pull(s, i)) {
+            pulling |= 1ULL << i;
+        }
     }
-    if ((changed || driving != s->driving) && s->drive_notify && !s->in_drive_notify) {
+    if ((changed || driving != s->driving || pulling != s->pulling) &&
+        s->drive_notify && !s->in_drive_notify) {
         s->driving = driving;
+        s->pulling = pulling;
         s->in_drive_notify = true;
         s->drive_notify(s->drive_notify_opaque);
         s->in_drive_notify = false;
     }
     s->driving = driving;
+    s->pulling = pulling;
 }
 
 void artemis_gpio_set_external(ArtemisGpioState *s, int pin, int level)
 {
     assert(pin >= 0 && pin < ARTEMIS_GPIO_COUNT);
-    s->ext[pin] = level < 0 ? ARTEMIS_GPIO_EXT_FLOATING : !!level;
+    s->ext[pin] = level < 0 ? level : !!level;
     update_pads(s);
+}
+
+int artemis_gpio_pull(ArtemisGpioState *s, int pin)
+{
+    return s->iomux[pin] & MUX_FUN_PU ? 1 : s->iomux[pin] & MUX_FUN_PD ? -1 : 0;
 }
 
 bool artemis_gpio_get_level(ArtemisGpioState *s, int pin)

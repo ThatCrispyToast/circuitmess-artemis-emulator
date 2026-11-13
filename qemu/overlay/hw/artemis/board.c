@@ -305,30 +305,33 @@ static void imu_interrupt(void *opaque, int n, int level)
 }
 
 /*
- * The charger's status pin sinks hard while charging, about 20 uA once the
- * battery is full, and floats without a supply. The watch pulls that net up
- * through 300 k and ties it to CHRG_OUT through 2.55 k, so firmware tells
- * "full" from "charging" by driving CHRG_OUT high and reading CHRG_IN.
+ * The charger's status pin sinks hard while charging and lets go the rest of
+ * the time, as a watch with a full battery shows. Its net, CHRG_IN, is pulled
+ * up through 300 k and tied to CHRG_OUT through 2.55 k: near enough one net,
+ * held so lightly that a driver or a pull on either pad decides it.
  */
 static void update_charger_nets(void *opaque)
 {
+    static const int pads[] = { ARTEMIS_PIN_CHRG_IN, ARTEMIS_PIN_CHRG_OUT };
     ArtemisBoardState *s = ARTEMIS_BOARD(opaque);
-    bool driven = artemis_gpio_is_output(s->gpio, ARTEMIS_PIN_CHRG_OUT);
-    bool driven_high = driven &&
-                       artemis_gpio_get_level(s->gpio, ARTEMIS_PIN_CHRG_OUT);
-    bool level;
+    bool sinking = s->usb_plugged && s->charging;
 
-    if (s->usb_plugged && s->charging) {
-        level = false;
-    } else if (s->usb_plugged) {
-        level = driven_high;
-    } else {
-        level = !driven || driven_high;
+    for (int i = 0; i < 2; i++) {
+        int pad = pads[i], other = pads[!i];
+        int level;
+
+        if (artemis_gpio_is_output(s->gpio, pad)) {
+            level = ARTEMIS_GPIO_EXT_FLOATING;
+        } else if (sinking) {
+            level = 0;
+        } else if (artemis_gpio_is_output(s->gpio, other)) {
+            level = artemis_gpio_get_level(s->gpio, other);
+        } else {
+            level = artemis_gpio_pull(s->gpio, other) < 0 ? ARTEMIS_GPIO_EXT_WEAK_LOW
+                                                          : ARTEMIS_GPIO_EXT_WEAK_HIGH;
+        }
+        artemis_gpio_set_external(s->gpio, pad, level);
     }
-
-    artemis_gpio_set_external(s->gpio, ARTEMIS_PIN_CHRG_IN, level);
-    artemis_gpio_set_external(s->gpio, ARTEMIS_PIN_CHRG_OUT,
-                              driven ? ARTEMIS_GPIO_EXT_FLOATING : level);
 }
 
 static void apply_battery(ArtemisBoardState *s)

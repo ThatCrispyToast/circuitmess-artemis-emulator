@@ -47,7 +47,9 @@
         version = "0.1.0";
         src = pkgs.lib.fileset.toSource {
           root = ./.;
-          fileset = pkgs.lib.fileset.fileFilter (file: file.hasExt "py") ./.;
+          fileset = pkgs.lib.fileset.fileFilter (
+            file: file.hasExt "py" || file.name == "watch_registers.txt"
+          ) ./.;
         };
         nativeBuildInputs = [ pkgs.makeWrapper ];
         installPhase = ''

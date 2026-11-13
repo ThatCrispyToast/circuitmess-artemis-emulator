@@ -267,7 +267,8 @@ static void i2c_reset_hold(Object *obj, ResetType type)
     fifo8_reset(&s->rx_fifo);
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->cmd, 0, sizeof(s->cmd));
-    s->int_raw = 0;
+    /* An empty transmit FIFO is below its watermark from the start. */
+    s->int_raw = INT_TXFIFO_WM;
     s->int_ena = 0;
 
     /* What the controller holds out of reset. */
