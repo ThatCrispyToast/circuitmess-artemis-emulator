@@ -14,17 +14,14 @@
       # CircuitMess's published images aren't redistributable from here, so they're
       # fetched from their releases when something needs them. 2.0 is the first for
       # this watch, and what hardware revision 2 shipped with.
-      stockReleases = {
-        "2.0" = "sha256-S89iP2ItiawvY6WeeFFoAyLDSf0YjNDLTNyS9IdRMzA=";
-        "2.1" = "sha256-DT9DZFbaOP/FEZsIFNG7J9L5mn7JUTjgZWM92yl5Bxk=";
-        "2.1.1" = "sha256-pW7V0MqWyurHB+/qb5wzrHkkVlG9EuPNfa1OBghN3mY=";
-        "2.2" = "sha256-3iyLrhbbYCzy4POhzRxe2zs41gu3L3quOcrSYeodeU4=";
-      };
+      # The same pins the emulator downloads by when it isn't run through Nix.
+      stock = (builtins.fromJSON (builtins.readFile ./artemis_emu/assets.json)).stock;
+      stockReleases = stock.releases;
       stockRelease =
         version:
         pkgs.fetchurl {
-          url = "https://github.com/CircuitMess/GC_Artemis-Firmware/releases/download/v${version}/Artemis-v${version}.bin";
-          hash = stockReleases.${version};
+          url = builtins.replaceStrings [ "{version}" ] [ version ] stock.url;
+          sha256 = stockReleases.${version}.sha256;
         };
       stockFirmware = stockRelease "2.2";
       stockFirmwareDir = pkgs.linkFarm "artemis-stock-firmware" (
@@ -59,7 +56,7 @@
         src = pkgs.lib.fileset.toSource {
           root = ./.;
           fileset = pkgs.lib.fileset.fileFilter (
-            file: file.hasExt "py" || file.name == "watch_registers.txt"
+            file: file.hasExt "py" || file.name == "watch_registers.txt" || file.name == "assets.json"
           ) ./.;
         };
         nativeBuildInputs = [ pkgs.makeWrapper ];

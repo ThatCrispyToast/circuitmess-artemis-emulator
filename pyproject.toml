@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "artemis-emu"
+version = "0.1.0"
+description = "Emulator for the CircuitMess NASA Artemis Watch 2.0"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # 6.12.0 miscounts references to None on Pythons before 3.12, and crashes there.
+    "PySide6-Essentials>=6.8; python_version >= '3.12'",
+    "PySide6-Essentials>=6.8,<6.12; python_version < '3.12'",
+    "PySide6-Addons>=6.8; python_version >= '3.12'",
+    "PySide6-Addons>=6.8,<6.12; python_version < '3.12'",
+    "pyserial>=3.5",
+    "esptool>=5.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+artemis-emu = "artemis_emu.__main__:main"
+
+[tool.setuptools]
+packages = ["artemis_emu"]
+
+[tool.setuptools.package-data]
+artemis_emu = ["assets.json"]

@@ -6,8 +6,8 @@ this project's MicroPython firmware. To run the same tests on a watch instead, p
 with that firmware on it and set ARTEMIS_TEST_ON_WATCH=1 (and ARTEMIS_WATCH_PORT if several
 are plugged in):
 
-    nix run . -- device flash micropython
-    ARTEMIS_TEST_ON_WATCH=1 nix develop -c python -m pytest tests/test_like_a_watch.py
+    artemis-emu device flash micropython
+    ARTEMIS_TEST_ON_WATCH=1 python -m pytest tests/test_like_a_watch.py
 """
 
 import ast
@@ -962,7 +962,7 @@ def record_watch_registers(resets=6):
     WATCH_REGISTERS.write_text(
         "# ESP32-S3 registers as a watch (hardware revision 2, on USB) has them once MicroPython\n"
         "# has started: those that read the same after every whole-chip reset. Written, with a watch\n"
-        "# plugged in, by: nix develop -c python -m tests.test_like_a_watch\n"
+        "# plugged in, by: python -m tests.test_like_a_watch\n"
         + "".join(f"{name} {dumps[0][name]}\n" for name in stable))
     print(f"{len(stable)} of {len(dumps[0])} registers are stable")
 

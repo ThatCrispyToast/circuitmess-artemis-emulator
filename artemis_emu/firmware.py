@@ -7,11 +7,14 @@ import struct
 from pathlib import Path
 from typing import Optional
 
+from . import assets
 from .flash import APP_OFFSET, PARTITION_MAGIC, PARTITION_TABLE_OFFSET
+
+_RELEASES = assets.PINS["stock"]["releases"]
 
 # CircuitMess's releases for this watch, oldest first. 2.0 is what hardware revision 2
 # left the factory with; revision 3 needs 2.1 or later.
-STOCK_VERSIONS = ("2.0", "2.1", "2.1.1", "2.2")
+STOCK_VERSIONS = tuple(_RELEASES)
 
 _APP_DESC_MAGIC = 0xABCD5432
 
@@ -20,28 +23,36 @@ class FirmwareNotFound(Exception):
     pass
 
 
-def _from_env(variable: str, what: str) -> Path:
-    path = os.environ.get(variable)
-    if not path:
-        raise FirmwareNotFound(f"{what} isn't available: run through `nix run`, or set {variable}")
-    return Path(path)
-
-
 def stock_firmware(version: Optional[str] = None) -> Path:
     """The factory firmware: the latest release, or the one asked for."""
     if version is None:
-        return _from_env("ARTEMIS_STOCK_FIRMWARE", "The stock firmware")
+        named = os.environ.get("ARTEMIS_STOCK_FIRMWARE")
+        if named:
+            return Path(named)
+        version = STOCK_VERSIONS[-1]
     version = version.lstrip("v")
     if version not in STOCK_VERSIONS:
         raise FirmwareNotFound(
             f"no stock firmware {version}: the releases are {', '.join(STOCK_VERSIONS)}"
         )
-    directory = _from_env("ARTEMIS_STOCK_FIRMWARE_DIR", "That stock firmware")
-    return directory / f"Artemis-v{version}.bin"
+    directory = os.environ.get("ARTEMIS_STOCK_FIRMWARE_DIR")
+    if directory:
+        return Path(directory) / f"Artemis-v{version}.bin"
+    try:
+        return assets.stock_firmware(version)
+    except assets.AssetError as error:
+        raise FirmwareNotFound(str(error)) from None
 
 
 def micropython_firmware() -> Path:
-    return _from_env("ARTEMIS_MICROPYTHON_FIRMWARE", "The MicroPython firmware")
+    """CircuitMess's MicroPython, as this project builds it."""
+    named = os.environ.get("ARTEMIS_MICROPYTHON_FIRMWARE")
+    if named:
+        return Path(named)
+    try:
+        return assets.micropython_firmware()
+    except assets.AssetError as error:
+        raise FirmwareNotFound(str(error)) from None
 
 
 def partitions(image: bytes) -> list[tuple[str, int, int, int, int]]:
@@ -67,16 +78,10 @@ def _elf_hash(image: bytes) -> bytes:
 
 def stock_release(image: bytes) -> Optional[str]:
     """Which CircuitMess release an image's application is, if it is one."""
-    wanted = _elf_hash(image)
-    directory = os.environ.get("ARTEMIS_STOCK_FIRMWARE_DIR")
-    if not wanted or not directory:
-        return None
-    for version in STOCK_VERSIONS:
-        path = Path(directory) / f"Artemis-v{version}.bin"
-        if path.exists():
-            with open(path, "rb") as release:
-                if _elf_hash(release.read(APP_OFFSET + 0x200)) == wanted:
-                    return version
+    wanted = _elf_hash(image).hex()
+    for version, release in _RELEASES.items():
+        if release["elf"] == wanted:
+            return version
     return None
 
 

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import glob
+import importlib.util
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -250,16 +252,20 @@ class Device:
         Runs an esptool command against the watch. `stay` leaves the chip in its
         bootloader for the next command; otherwise it restarts into its firmware.
         """
-        binary = shutil.which("esptool")
-        if not binary:
-            raise DeviceError("esptool wasn't found: run through `nix run` or `nix develop`")
+        # This environment's own esptool before any other on the PATH, whose commands may differ.
+        if importlib.util.find_spec("esptool"):
+            esptool = [sys.executable, "-m", "esptool"]
+        elif shutil.which("esptool"):
+            esptool = [shutil.which("esptool")]
+        else:
+            raise DeviceError("esptool wasn't found: install it with `pip install esptool`")
         was_open = self.usb_port is not None
         self.port = self._resolve_port()
         self.close()
 
         # esptool's own reset at the end only works if it also did the one at the start,
         # so it's always told to leave the chip alone and the restart is done here.
-        command = [binary, "--chip", "esp32s3", "--port", self.port,
+        command = esptool + ["--chip", "esp32s3", "--port", self.port,
                    "--before", "no-reset" if self._in_bootloader else "default-reset",
                    "--after", "no-reset"]
         try:

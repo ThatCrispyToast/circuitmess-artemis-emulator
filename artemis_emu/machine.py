@@ -18,8 +18,10 @@ import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional, Pattern, Union
 
+from . import assets
 from .bridge import Bridge, BoardState
 from .efuse import DEFAULT_REVISION, build_efuse
+from .firmware import stock_firmware
 from .flash import FLASH_SIZE, build_flash_image
 from .image import rgb565_to_rgb888, save_png
 
@@ -54,12 +56,11 @@ class EmulatorError(Exception):
 
 def find_qemu() -> tuple[str, str]:
     """Returns the QEMU binary and its firmware data directory."""
-    binary = os.environ.get("ARTEMIS_QEMU") or shutil.which("qemu-system-xtensa")
-    if not binary:
-        raise EmulatorError(
-            "qemu-system-xtensa wasn't found: run through `nix run`, or set ARTEMIS_QEMU"
-        )
-    return binary, str(Path(binary).resolve().parent.parent / "share" / "qemu")
+    try:
+        binary = assets.qemu()
+    except assets.AssetError as error:
+        raise EmulatorError(str(error)) from None
+    return str(binary), str(binary.resolve().parent.parent / "share" / "qemu")
 
 
 def _runtime_dir() -> str:
@@ -227,12 +228,11 @@ class Watch:
 
     def start(self) -> "Watch":
         qemu, data_dir = find_qemu()
-        base = os.environ.get("ARTEMIS_STOCK_FIRMWARE")
 
         # Checks the firmware before anything is created that would need cleaning up.
         image = None
         if not self.flash_file or not self._flash_file_usable():
-            image = build_flash_image(self.firmware, base)
+            image = build_flash_image(self.firmware, stock_firmware)
 
         self._run_dir = _runtime_dir()
         run = Path(self._run_dir)

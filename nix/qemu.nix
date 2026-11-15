@@ -82,21 +82,8 @@ let
       patchShebangs .
     '';
 
-    configureFlags = [
-      "--prefix=/"
-      "--target-list=xtensa-softmmu"
-      "--without-default-features"
-      "--disable-download"
-      "--disable-docs"
-      "--disable-tools"
-      "--disable-guest-agent"
-      "--disable-werror"
-      "--disable-debug-info"
-      "--enable-tcg"
-      "--enable-gcrypt"
-      "--enable-pixman"
-      "--enable-slirp"
-    ];
+    # Shared with qemu/tools/build.sh, which builds the same thing without Nix.
+    configureFlags = lib.splitString "\n" (lib.removeSuffix "\n" (builtins.readFile ../qemu/configure-flags));
 
     preBuild = "cd build";
 

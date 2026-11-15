@@ -3,13 +3,10 @@
 `artemis_emu` lets a test act as the user and look at what the watch does:
 
 ```python
-import os
-from artemis_emu import PythonSession, Watch
-
-FIRMWARE = os.environ["ARTEMIS_MICROPYTHON_FIRMWARE"]
+from artemis_emu import PythonSession, Watch, micropython_firmware
 
 def test_lever_push_lights_an_led():
-    with Watch(FIRMWARE) as watch:
+    with Watch(micropython_firmware()) as watch:
         session = PythonSession(watch)
         session.start(open("examples/hello.py").read())
         # Once it has drawn its text, it's reading the lever.
@@ -22,8 +19,9 @@ def test_lever_push_lights_an_led():
         assert session.wait(timeout=5).strip() == "pushed 1 times"
 ```
 
-Run it with `nix develop -c python -m pytest my_test.py`, which provides the emulator, firmware and
-Python. `tests/test_examples.py` has more of this.
+Run it with `python -m pytest my_test.py`, once `pip install '.[test]'` has added pytest to the
+emulator's environment. `micropython_firmware()` and `stock_firmware()` give the images the
+emulator comes with. `tests/test_examples.py` has more of this.
 
 ## `Watch`
 
@@ -67,6 +65,6 @@ with Device() as watch:
 on the emulator by default or on a watch with this project's MicroPython on it:
 
 ```sh
-nix run . -- device flash micropython
-ARTEMIS_TEST_ON_WATCH=1 nix develop -c python -m pytest tests/test_like_a_watch.py
+artemis-emu device flash micropython
+ARTEMIS_TEST_ON_WATCH=1 python -m pytest tests/test_like_a_watch.py
 ```

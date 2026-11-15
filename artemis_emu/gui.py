@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import array
+import ctypes
 import math
 import os
 import signal
@@ -12,8 +13,8 @@ import threading
 import time
 from typing import Callable, Optional
 
-from PySide6.QtCore import QRect, Qt, QTimer, qInstallMessageHandler
-from PySide6.QtGui import QColor, QImage, QPainter, QPalette
+from PySide6.QtCore import QLibraryInfo, QRect, Qt, QTimer, qInstallMessageHandler
+from PySide6.QtGui import QColor, QFontDatabase, QImage, QPainter, QPalette
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
@@ -48,6 +49,36 @@ def _qt_message(kind, context, message: str) -> None:
     if category.startswith("qt.multimedia") or message.startswith("No QtMultimedia backends"):
         return
     print(message if category == "default" else f"{category}: {message}", file=sys.stderr)
+
+
+def display_problem() -> Optional[str]:
+    """
+    Why a window can't be opened here, if it can't: Qt's own way of saying so is
+    to abort the program.
+    """
+    if os.environ.get("QT_QPA_PLATFORM"):
+        return None
+    directory = os.path.join(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath), "platforms")
+    plugins = []
+    if os.environ.get("WAYLAND_DISPLAY"):
+        plugins += sorted(name for name in os.listdir(directory) if name.startswith("libqwayland"))
+    if os.environ.get("DISPLAY"):
+        plugins.append("libqxcb.so")
+    if not plugins:
+        return "there is no display to open it on"
+    problem = None
+    for name in plugins:
+        try:
+            ctypes.CDLL(os.path.join(directory, name))
+            return None
+        except OSError as error:
+            problem = problem or missing_library(error)
+    return problem
+
+
+def missing_library(error: Exception) -> str:
+    return (f"this system lacks a library Qt needs ({str(error).split(':')[0]}); "
+            "docs/install.md lists the packages")
 
 
 class Buzzer:
@@ -241,6 +272,9 @@ class WatchWindow(QMainWindow):
     ):
         qInstallMessageHandler(_qt_message)
         self._app = QApplication.instance() or QApplication(sys.argv[:1])
+        if not QFontDatabase.families():
+            print("No fonts are installed, so the window's labels will be blank: "
+                  "install one, such as DejaVu Sans.", file=sys.stderr, flush=True)
         super().__init__()
         self.watch = watch
         self.screenshot_dir = screenshot_dir

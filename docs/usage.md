@@ -3,11 +3,10 @@
 ## Commands
 
 ```sh
-nix run . -- stock                      # CircuitMess's factory firmware
-nix run . -- python examples/hello.py   # a MicroPython program
-nix run . -- repl                       # a MicroPython prompt (Ctrl-] quits)
-nix run . -- run firmware.bin           # a firmware you built
-nix run .#test                          # this project's tests
+artemis-emu stock                      # CircuitMess's factory firmware
+artemis-emu python examples/hello.py   # a MicroPython program
+artemis-emu repl                       # a MicroPython prompt (Ctrl-] quits)
+artemis-emu run firmware.bin           # a firmware you built
 ```
 
 `run` accepts a merged flash image, a bare application image (placed behind the stock firmware's
@@ -35,8 +34,8 @@ Options, for any of these commands:
 boot, the way a program from CircuitBlocks does:
 
 ```sh
-nix run . -- python my_program.py --install --flash my_watch.bin
-nix run . -- repl --flash my_watch.bin   # boots into main.py; Ctrl-C for a prompt
+artemis-emu python my_program.py --install --flash my_watch.bin
+artemis-emu repl --flash my_watch.bin   # boots into main.py; Ctrl-C for a prompt
 ```
 
 ## In the window
@@ -66,14 +65,14 @@ which a real watch is.
 Plug the watch in over USB and the same commands work on it:
 
 ```sh
-nix run . -- device info                        # chip, revision, and what firmware it's running
-nix run . -- device backup my-watch.bin         # save its whole flash, and do this first
-nix run . -- device flash micropython           # put this project's MicroPython on it
-nix run . -- python examples/hello.py --device  # run a program on the watch
-nix run . -- repl --device
-nix run . -- device monitor --reset             # watch it boot
-nix run . -- device flash stock --version 2.0   # a CircuitMess release
-nix run . -- device restore my-watch.bin        # exactly as it was
+artemis-emu device info                        # chip, revision, and what firmware it's running
+artemis-emu device backup my-watch.bin         # save its whole flash, and do this first
+artemis-emu device flash micropython           # put this project's MicroPython on it
+artemis-emu python examples/hello.py --device  # run a program on the watch
+artemis-emu repl --device
+artemis-emu device monitor --reset             # watch it boot
+artemis-emu device flash stock --version 2.0   # a CircuitMess release
+artemis-emu device restore my-watch.bin        # exactly as it was
 ```
 
 `device flash` also takes a firmware file. Flashing MicroPython keeps a MicroPython filesystem

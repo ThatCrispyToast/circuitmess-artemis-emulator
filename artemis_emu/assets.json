@@ -1,0 +1,34 @@
+{
+  "release": "https://github.com/ThatCrispyToast/circuitmess-artemis-emulator/releases/download/v0.1.0",
+  "qemu": {
+    "linux-x86_64": {
+      "file": "qemu-artemis-9.2.2-20260417-linux-x86_64.tar.xz",
+      "sha256": "13b22408901424bb1908d93dbc1dcfdde37e9b8c32242538ad95e4d93c714222"
+    }
+  },
+  "micropython": {
+    "file": "micropython-circuitmess-s3-02bf648.bin",
+    "sha256": "c1eed725938cf984a6e4a848876a3d62e84fb6427aec1e9e1c2e8236db380d02"
+  },
+  "stock": {
+    "url": "https://github.com/CircuitMess/GC_Artemis-Firmware/releases/download/v{version}/Artemis-v{version}.bin",
+    "releases": {
+      "2.0": {
+        "sha256": "4bcf623f622d89ac2f63a59e7851680322c349fd188cd0cb4cdc92f487513330",
+        "elf": "b7bfb4411854fd5cd8a3199910189319f39cf951665e57666fbb9ce9d1d11595"
+      },
+      "2.1": {
+        "sha256": "0d3f436456da38ffc5119b0814d1bb27d2f99a7ec95138e065633ddb29790719",
+        "elf": "81ecba26e0ed734bddb1ec592cac7dce67e95811a70d4e692f914833b2ce8626"
+      },
+      "2.1.1": {
+        "sha256": "a56ed5d0ca96caeac707efea6f9c33ac79245651bd12e3cd7dad4e06084dde66",
+        "elf": "a90c1c71de5e966d861f971cddc6880c04b68f7a1686e3c5999b983a19334dab"
+      },
+      "2.2": {
+        "sha256": "de2c8bae16db602cf2e0f3a1cd1c5edb3b38d60bb72f7aae39cad261ea1d794e",
+        "elf": "8f5e984486094ba3c28f9248d055c70600981edba37581abc5e3f84e3231a123"
+      }
+    }
+  }
+}

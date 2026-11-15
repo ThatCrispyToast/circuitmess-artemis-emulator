@@ -4,7 +4,32 @@ import signal
 
 import pytest
 
-from artemis_emu import Watch
+from artemis_emu import STOCK_VERSIONS, Watch, micropython_firmware, stock_firmware
+from artemis_emu.firmware import FirmwareNotFound
+
+
+def _name_firmware() -> None:
+    """
+    The tests take firmware from the variables the Nix package sets. Installed any
+    other way, the emulator fetches the images itself, and they are named here.
+    What can't be had stays unset, and the tests that need it are skipped.
+    """
+    try:
+        if "ARTEMIS_STOCK_FIRMWARE_DIR" not in os.environ:
+            releases = [stock_firmware(version) for version in STOCK_VERSIONS]
+            os.environ["ARTEMIS_STOCK_FIRMWARE_DIR"] = str(releases[-1].parent)
+        os.environ.setdefault("ARTEMIS_STOCK_FIRMWARE", str(stock_firmware()))
+    except FirmwareNotFound:
+        pass
+    try:
+        os.environ.setdefault("ARTEMIS_MICROPYTHON_FIRMWARE", str(micropython_firmware()))
+    except FirmwareNotFound:
+        pass
+
+
+_name_firmware()
+# For tests that take the variables above away.
+os.environ.setdefault("ARTEMIS_TEST_STOCK", os.environ.get("ARTEMIS_STOCK_FIRMWARE", ""))
 
 STOCK = os.environ.get("ARTEMIS_STOCK_FIRMWARE")
 MICROPYTHON = os.environ.get("ARTEMIS_MICROPYTHON_FIRMWARE")

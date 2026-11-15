@@ -24,51 +24,23 @@ the display, lever, button, LEDs, buzzer, motion sensor, clock and battery aroun
 
 ## Quick start
 
-It runs on x86-64 Linux, and on Windows through WSL. [Nix](https://nixos.org) builds it and is
-the one thing to install: the rest is fetched or built at pinned versions, and kept in the Nix
-store.
-
-**1. Install Nix**, unless you have it.
-
-- **Ubuntu, Debian**
-
-  ```sh
-  sudo apt install -y curl git xz-utils
-  sh <(curl -L https://nixos.org/nix/install) --daemon
-  ```
-
-- **Other distributions:** install `curl`, `git` and `xz` with your package manager, then run
-  the same installer. Where SELinux is enforcing, as on Fedora, it needs `--no-daemon` in place
-  of `--daemon`.
-
-- **Windows 11:** run `wsl --install` in PowerShell as administrator, and restart. Open
-  Ubuntu from the Start menu and carry on in it as for Ubuntu. The watch's window opens on the
-  Windows desktop.
-
-**2. Turn on flakes**, unless they are, in a new terminal:
-
-```sh
-mkdir -p ~/.config/nix
-echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
-```
-
-**3. Run it.**
+On x86-64 Linux, or Windows through WSL, with Python 3.10 or later:
 
 ```sh
 git clone https://github.com/ThatCrispyToast/circuitmess-artemis-emulator
 cd circuitmess-artemis-emulator
-nix run . -- stock                      # CircuitMess's factory firmware
-nix run . -- python examples/hello.py   # a MicroPython program
-nix run . -- repl                       # a MicroPython prompt (Ctrl-] quits)
-nix run . -- run firmware.bin           # a firmware you built
+python3 -m venv .venv && . .venv/bin/activate
+pip install .
+
+artemis-emu stock                      # CircuitMess's factory firmware
+artemis-emu python examples/hello.py   # a MicroPython program
+artemis-emu repl                       # a MicroPython prompt (Ctrl-] quits)
+artemis-emu run firmware.bin           # a firmware you built
 ```
 
-The first run builds QEMU and MicroPython from source, which takes a few minutes and about
-5 GB of disk.
-
-In the window, Left and Right work the lever, Enter pushes it, Esc is the side button, and
-W A S D tilt the watch. The side panel has the battery, USB cable, taps and steps. Every option
-and key is in [docs/usage.md](docs/usage.md).
+QEMU and the firmware are downloaded on first use. [docs/install.md](docs/install.md) covers
+system packages, Windows, Nix and building from source; [docs/usage.md](docs/usage.md) has
+every option and key.
 
 ## Your own programs
 
@@ -83,7 +55,7 @@ are in [`examples/`](examples). `--install` stores a script as `main.py`, so tha
 every boot the way a program from CircuitBlocks does:
 
 ```sh
-nix run . -- python my_program.py --install --flash my_watch.bin
+artemis-emu python my_program.py --install --flash my_watch.bin
 ```
 
 ## With a real watch
@@ -91,11 +63,11 @@ nix run . -- python my_program.py --install --flash my_watch.bin
 Plug the watch in over USB:
 
 ```sh
-nix run . -- device info                        # chip, revision, and what firmware it's running
-nix run . -- device backup my-watch.bin         # save its whole flash, and do this first
-nix run . -- device flash micropython           # put this project's MicroPython on it
-nix run . -- python examples/hello.py --device  # run a program on the watch
-nix run . -- device restore my-watch.bin        # exactly as it was
+artemis-emu device info                        # chip, revision, and what firmware it's running
+artemis-emu device backup my-watch.bin         # save its whole flash, and do this first
+artemis-emu device flash micropython           # put this project's MicroPython on it
+artemis-emu python examples/hello.py --device  # run a program on the watch
+artemis-emu device restore my-watch.bin        # exactly as it was
 ```
 
 More, including the udev rule your user needs, in [docs/usage.md](docs/usage.md#with-a-real-watch).
@@ -103,13 +75,10 @@ More, including the udev rule your user needs, in [docs/usage.md](docs/usage.md#
 ## Testing your code
 
 ```python
-import os
-from artemis_emu import PythonSession, Watch
-
-FIRMWARE = os.environ["ARTEMIS_MICROPYTHON_FIRMWARE"]
+from artemis_emu import PythonSession, Watch, micropython_firmware
 
 def test_lever_push_lights_an_led():
-    with Watch(FIRMWARE) as watch:
+    with Watch(micropython_firmware()) as watch:
         session = PythonSession(watch)
         session.start(open("examples/hello.py").read())
         watch.wait_until(lambda: (255, 255, 255) in watch.pixels())
@@ -119,7 +88,7 @@ def test_lever_push_lights_an_led():
 ```
 
 A test presses buttons, tilts the watch, changes the battery, and looks at pixels, LEDs, the
-buzzer and serial output. `nix develop` provides the firmware and pytest. A `PythonSession`
+buzzer and serial output. `pip install '.[test]'` adds pytest. A `PythonSession`
 works the same on a `Device`, a real watch on USB, so a test of what your code prints can run
 on hardware too. The API is in [docs/testing.md](docs/testing.md).
 

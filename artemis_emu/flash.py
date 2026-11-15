@@ -49,8 +49,7 @@ def _from_app_image(app: bytes, base_image: bytes | None) -> bytes:
     if base_image is None or not _has_partition_table(base_image):
         raise FirmwareError(
             "this is a bare application image, and needs a bootloader and partition "
-            "table from somewhere: pass a merged image, or set ARTEMIS_STOCK_FIRMWARE "
-            "so the stock firmware's can be used"
+            "table from somewhere: pass a merged image"
         )
 
     image = bytearray(_pad(base_image[: APP_OFFSET]))
@@ -81,8 +80,12 @@ def flash_plan(source: str | Path) -> list[tuple[int, Path]]:
     return [(0 if _has_partition_table(data) else APP_OFFSET, path)]
 
 
-def build_flash_image(source: str | Path, base_image_path: str | Path | None = None) -> bytes:
-    """Accepts a merged flash image, a bare app image, or an ESP-IDF build directory."""
+def build_flash_image(source: str | Path, base_image=None) -> bytes:
+    """
+    Accepts a merged flash image, a bare app image, or an ESP-IDF build directory.
+    A bare app goes behind the bootloader and partition table of `base_image`: a
+    path, or a function that gives one, called only if it comes to that.
+    """
     path = Path(source)
 
     if path.is_dir():
@@ -104,5 +107,5 @@ def build_flash_image(source: str | Path, base_image_path: str | Path | None = N
     if _has_partition_table(data):
         return _pad(data)
 
-    base = Path(base_image_path).read_bytes() if base_image_path else None
-    return _from_app_image(data, base)
+    base = base_image() if callable(base_image) else base_image
+    return _from_app_image(data, Path(base).read_bytes() if base else None)

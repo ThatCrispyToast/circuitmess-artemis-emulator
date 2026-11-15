@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from .device import Device, DeviceError
+from .assets import AssetError
 from .firmware import (STOCK_VERSIONS, FirmwareNotFound, describe, micropython_firmware,
                        stock_firmware)
 from .flash import FLASH_SIZE, FirmwareError, flash_plan
@@ -110,7 +111,14 @@ def _forward_stdin(watch: Watch) -> None:
 
 def _run_window(watch: Watch, args: argparse.Namespace, title: str, should_stop=None) -> None:
     # Imported late so that headless use needs no graphics stack.
-    from .gui import WatchWindow
+    try:
+        from .gui import WatchWindow, display_problem
+        problem = display_problem()
+    except ImportError as error:
+        problem = (f"this system lacks a library Qt needs ({str(error).split(':')[0]}); "
+                   "docs/install.md lists the packages")
+    if problem:
+        raise EmulatorError(f"the window can't open: {problem}. --headless runs without one")
 
     window = WatchWindow(watch, scale=args.scale, sound=not args.mute, title=title)
     deadline = time.monotonic() + args.timeout if args.timeout else None
@@ -437,7 +445,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.command == "repl":
             return cmd_repl(args)
         return cmd_device(args)
-    except (EmulatorError, FirmwareError, FirmwareNotFound, DeviceError) as e:
+    except (EmulatorError, FirmwareError, FirmwareNotFound, DeviceError, AssetError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
