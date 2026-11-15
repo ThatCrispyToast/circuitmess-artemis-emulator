@@ -1,6 +1,6 @@
 # Artemis Watch emulator
 
-An emulator for the [CircuitMess NASA Artemis Watch 2.0](https://circuitmess.com/products/nasa-artemis-watch-2-0). It runs the watch's real, unmodified firmware on your computer: a dual-core ESP32-S3 in QEMU, with the display, lever, button, LEDs, buzzer, motion sensor, clock and battery around it.
+A QEMU-based emulator for the [CircuitMess NASA Artemis Watch 2.0](https://circuitmess.com/products/nasa-artemis-watch-2-0) that runs its unmodified ESP32-S3 firmware.
 
 <p align="center">
   <img src="docs/images/emulator.gif" width="760"
@@ -9,16 +9,14 @@ An emulator for the [CircuitMess NASA Artemis Watch 2.0](https://circuitmess.com
 
 ## Features
 
-- **Runs what the watch runs.** CircuitMess's stock firmware (2.0 to 2.2), their MicroPython, or a firmware you built with ESP-IDF.
-- **The whole watch.** Display, inputs, LEDs and buzzer, motion sensor, real-time clock, battery and charging, sleep, watchdogs and flash. Bluetooth and Wi-Fi start, with nobody to talk to.
-- **The chip's timing.** Code takes as long as it does on the watch, to within a few percent, and sleeps and timers are right to microseconds.
-- **Checked against hardware.** The same tests pass on the emulator and on a real watch.
-- **Scriptable.** A Python API works the watch and reads its display, LEDs and serial output, for automated tests. There's a headless mode, screenshots and a GDB stub.
-- **Works with a real watch too.** Back it up, flash it, restore it, and run the same program on it.
+- Supports CircuitMess's stock firmware (2.0–2.2), MicroPython, and custom ESP-IDF firmware.
+- Emulates the dual-core CPU, display, lever, button, LEDs, buzzer, motion sensor, real-time clock, battery and charging, sleep, watchdogs, and flash.
+- Provides a Python test API, headless mode, screenshots, and GDB debugging.
+- Includes USB tools to inspect, back up, flash, and restore a physical watch.
 
 ## Quick start
 
-On x86-64 Linux, or Windows through WSL, with Python 3.10 or later:
+Requires x86-64 Linux or Windows with WSL 2, and Python 3.10 or later.
 
 ```sh
 git clone https://github.com/ThatCrispyToast/circuitmess-artemis-emulator
@@ -29,12 +27,12 @@ pip install .
 artemis-emu stock                      # CircuitMess's factory firmware
 artemis-emu python examples/hello.py   # a MicroPython program
 artemis-emu repl                       # a MicroPython prompt (Ctrl-] quits)
-artemis-emu run firmware.bin           # a firmware you built
+artemis-emu run firmware.bin           # custom firmware
 ```
 
-QEMU and the firmware are downloaded on first use. [docs/install.md](docs/install.md) covers system packages, Windows, Nix and building from source; [docs/usage.md](docs/usage.md) has every option and key.
+QEMU and firmware are downloaded on first use. See the [installation guide](docs/install.md) for system packages, Windows, Nix, and source builds, or the [usage guide](docs/usage.md) for commands and keyboard controls.
 
-## Your own programs
+## Writing programs
 
 <p align="center">
   <img src="docs/images/hello.png" width="190" alt="examples/hello.py: a greeting and a count of lever pushes">
@@ -42,25 +40,27 @@ QEMU and the firmware are downloaded on first use. [docs/install.md](docs/instal
   <img src="docs/images/clock.png" width="190" alt="examples/clock.py: the time from the real-time clock">
 </p>
 
-MicroPython programs use CircuitMess's `Artemis` library, as they do on the watch; the ones above are in [`examples/`](examples). `--install` stores a script as `main.py`, so that it runs at every boot the way a program from CircuitBlocks does:
+MicroPython programs use CircuitMess's `Artemis` library. The programs shown above are in [`examples/`](examples).
+
+Use `--install` to save a script as `main.py` in a persistent flash image and run it at boot:
 
 ```sh
 artemis-emu python my_program.py --install --flash my_watch.bin
 ```
 
-## With a real watch
+## Using a physical watch
 
-Plug the watch in over USB:
+Connect the watch over USB. Back up its flash before changing the firmware:
 
 ```sh
-artemis-emu device info                        # chip, revision, and what firmware it's running
-artemis-emu device backup my-watch.bin         # save its whole flash, and do this first
-artemis-emu device flash micropython           # put this project's MicroPython on it
-artemis-emu python examples/hello.py --device  # run a program on the watch
-artemis-emu device restore my-watch.bin        # exactly as it was
+artemis-emu device info                       # chip, hardware revision, and firmware
+artemis-emu device backup my-watch.bin         # save the full flash
+artemis-emu device flash micropython          # install this project's MicroPython build
+artemis-emu python examples/hello.py --device  # run a program
+artemis-emu device restore my-watch.bin        # restore the backup
 ```
 
-More, including the udev rule your user needs, in [docs/usage.md](docs/usage.md#with-a-real-watch).
+See the [USB setup instructions](docs/usage.md#with-a-real-watch) for serial port permissions and udev rules.
 
 ## Testing your code
 
@@ -77,42 +77,44 @@ def test_lever_push_lights_an_led():
         watch.wait_until(lambda: watch.leds[0] == 1.0, timeout=2)
 ```
 
-A test presses buttons, tilts the watch, changes the battery, and looks at pixels, LEDs, the buzzer and serial output. `pip install '.[test]'` adds pytest. A `PythonSession` works the same on a `Device`, a real watch on USB, so a test of what your code prints can run on hardware too. The API is in [docs/testing.md](docs/testing.md).
+The API can control buttons, motion, and battery state, and read pixels, LEDs, buzzer state, and serial output. Install pytest with `pip install '.[test]'`.
+
+`PythonSession` also accepts a USB-connected `Device`, so tests that check program output can run on hardware. See the [testing guide](docs/testing.md) for the API.
 
 ## Accuracy
 
-The emulator is held to measurements taken on a watch; `tests/test_like_a_watch.py` runs on either.
+[`tests/test_like_a_watch.py`](tests/test_like_a_watch.py) checks the emulator against measurements from a hardware revision 2 watch. The same tests can run on the watch.
 
-| | Emulator against the watch |
+| Metric | Comparison with hardware |
 | --- | --- |
-| Speed of code | 17 of 27 MicroPython operations within 3%, all within 11% |
-| Sleeps and timers | within microseconds, and UART and PWM keep their rates |
-| Registers | 1994 of 2004 compared read the same |
-| Resets and watchdogs | same causes, same timing, same state left behind |
+| Execution speed | 17 of 27 MicroPython operations within 3%, all within 11% |
+| Sleeps and timers | Within microseconds; UART and PWM rates match |
+| Registers | 1994 of 2004 register values match |
+| Resets and watchdogs | Matching causes, timing, and retained state |
 
-What is emulated and how it was measured are in [docs/accuracy.md](docs/accuracy.md).
+See [emulation coverage and measurements](docs/accuracy.md) for details.
 
 ## Limitations
 
-- Nothing goes on the air. Bluetooth and Wi-Fi start but never connect, so pairing with a phone can't be tested.
-- Turning Wi-Fi off takes five seconds, where a watch takes milliseconds.
-- Memory-heavy work runs up to 15% fast, since flash and PSRAM never miss the cache.
-- In a virtual machine, WSL included, code that works a peripheral hard runs up to a third slow.
-- Keeping the chip's timing takes about one core of your computer while the watch is busy.
-- The ULP coprocessor, USB OTG, TWAI, motor PWM, SD host, camera and LCD interfaces do nothing.
-- The ADC reads ideal voltages, the buzzer is a square wave, and nothing draws current.
-- The published QEMU is for x86-64 Linux with glibc 2.34 or later. Anywhere else, build it from source.
-- Rebuilding the MicroPython image takes Nix.
-- Using a real watch from WSL needs usbipd-win, and hasn't been tried.
+- Bluetooth and Wi-Fi initialize but cannot transmit or connect. Phone pairing cannot be tested.
+- Wi-Fi shutdown takes five seconds instead of milliseconds.
+- Memory-heavy workloads run up to 15% faster because flash and PSRAM cache misses are not modeled.
+- Peripheral-heavy workloads run up to a third slower in virtual machines, including WSL.
+- Matching chip timing uses about one host CPU core while the watch is busy.
+- The ULP coprocessor, USB OTG, TWAI, motor PWM, SD host, camera, and LCD interfaces are not emulated.
+- ADC voltages are ideal, the buzzer produces a square wave, and power consumption is not modeled.
+- Prebuilt QEMU requires x86-64 Linux with glibc 2.34 or later. Other systems require a source build.
+- Rebuilding the MicroPython image requires Nix.
+- USB access to a physical watch from WSL requires usbipd-win and is untested.
 
 ## How it works
 
-[Espressif's QEMU fork](https://github.com/espressif/qemu) emulates the ESP32-S3. This project adds the watch's devices and the parts of the chip that fork lacks, paces the CPUs to the chip's speed, and puts a Python front end, window and test API on top. Both firmwares are fetched or built by the flake, at pinned versions. See [docs/internals.md](docs/internals.md).
+The emulator extends [Espressif's QEMU fork](https://github.com/espressif/qemu) with watch peripherals, additional ESP32-S3 components, and CPU timing adjustments. A Python package provides the GUI, CLI, and test API. The Nix flake builds or fetches both firmware images at pinned versions. See the [internals guide](docs/internals.md).
 
 ## Credits and license
 
-Built on [QEMU](https://www.qemu.org) and Espressif's fork of it. The firmware it runs is CircuitMess's: their [stock firmware](https://github.com/CircuitMess/GC_Artemis-Firmware) and their [MicroPython](https://github.com/CircuitMess/micropython), neither of which is kept in this repository.
+This project uses [QEMU](https://www.qemu.org), Espressif's fork, and CircuitMess's [stock firmware](https://github.com/CircuitMess/GC_Artemis-Firmware) and [MicroPython](https://github.com/CircuitMess/micropython). Firmware images are not stored in this repository.
 
-The device models and the patch under `qemu/` are GPL-2.0-or-later, as QEMU is.
+The device models and patch under `qemu/` are licensed under GPL-2.0-or-later, matching QEMU.
 
 This is an independent project, not affiliated with or endorsed by CircuitMess or NASA.
