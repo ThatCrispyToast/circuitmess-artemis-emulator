@@ -90,7 +90,20 @@ The emulator is held to measurements taken on a watch; `tests/test_like_a_watch.
 | Registers | 1994 of 2004 compared read the same |
 | Resets and watchdogs | same causes, same timing, same state left behind |
 
-What it can't tell you: anything that needs radio traffic, since nothing goes on the air; and exact timing of memory-heavy work, which runs up to 15% fast. In a virtual machine, WSL included, timing is looser for code that works a peripheral hard. Keeping time costs about one core of your computer while the watch is busy. What is emulated, how it was measured and the other limits are in [docs/accuracy.md](docs/accuracy.md).
+What is emulated and how it was measured are in [docs/accuracy.md](docs/accuracy.md).
+
+## Limitations
+
+- Nothing goes on the air. Bluetooth and Wi-Fi start but never connect, so pairing with a phone can't be tested.
+- Turning Wi-Fi off takes five seconds, where a watch takes milliseconds.
+- Memory-heavy work runs up to 15% fast, since flash and PSRAM never miss the cache.
+- In a virtual machine, WSL included, code that works a peripheral hard runs up to a third slow.
+- Keeping the chip's timing takes about one core of your computer while the watch is busy.
+- The ULP coprocessor, USB OTG, TWAI, motor PWM, SD host, camera and LCD interfaces do nothing.
+- The ADC reads ideal voltages, the buzzer is a square wave, and nothing draws current.
+- The published QEMU is for x86-64 Linux with glibc 2.34 or later. Anywhere else, build it from source.
+- Rebuilding the MicroPython image takes Nix.
+- Using a real watch from WSL needs usbipd-win, and hasn't been tried.
 
 ## How it works
 
