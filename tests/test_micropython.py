@@ -301,12 +301,13 @@ def test_led_brightness_follows_pwm(micropython):
 def test_rgb_led_mixes_channels(micropython):
     watch = micropython.watch
     micropython.run(SETUP + "Artemis.rgb.set(100, 50, 0)")
-    # A new duty takes effect at the end of the PWM period, a millisecond here.
-    watch.wait_until(lambda: watch.rgb_led[0] > 0.99, timeout=1)
-    r, g, b = watch.rgb_led
     # The driver squares brightness for a linear response to the eye.
-    assert g == pytest.approx(0.25, abs=0.02)
-    assert b < 0.01
+    def mixed():
+        r, g, b = watch.rgb_led
+        return r > 0.99 and g == pytest.approx(0.25, abs=0.02) and b < 0.01
+
+    # PWM channels latch separately at their period boundaries.
+    watch.wait_until(mixed, timeout=1)
 
 
 def test_buzzer_plays_the_requested_tone(micropython):
