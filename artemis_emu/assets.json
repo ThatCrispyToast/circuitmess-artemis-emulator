@@ -3,12 +3,16 @@
   "qemu": {
     "linux-x86_64": {
       "file": "qemu-artemis-9.2.2-20260417-linux-x86_64.tar.xz",
-      "sha256": "13b22408901424bb1908d93dbc1dcfdde37e9b8c32242538ad95e4d93c714222"
+      "sha256": "0c7060047656a7af5013cb7efec90c065d0f5e35338faa32fade488742aeb0bb"
     }
   },
   "micropython": {
     "file": "micropython-circuitmess-s3-02bf648.bin",
-    "sha256": "c1eed725938cf984a6e4a848876a3d62e84fb6427aec1e9e1c2e8236db380d02"
+    "sha256": "c1eed725938cf984a6e4a848876a3d62e84fb6427aec1e9e1c2e8236db380d02",
+    "notices": {
+      "file": "micropython-circuitmess-s3-02bf648-NOTICES.txt",
+      "sha256": "48d353455dc7119860fcd6807dbfb4b8be3f27344e59f528dfc3fd26e5a0d60e"
+    }
   },
   "stock": {
     "url": "https://github.com/CircuitMess/GC_Artemis-Firmware/releases/download/v{version}/Artemis-v{version}.bin",

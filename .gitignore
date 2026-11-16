@@ -3,5 +3,6 @@ __pycache__/
 result
 result-*
 build/
+dist/
 .venv/
 *.egg-info/

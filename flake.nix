@@ -56,7 +56,7 @@
         src = pkgs.lib.fileset.toSource {
           root = ./.;
           fileset = pkgs.lib.fileset.fileFilter (
-            file: file.hasExt "py" || file.name == "watch_registers.txt" || file.name == "assets.json"
+            file: file.hasExt "py" || builtins.elem file.name [ "watch_registers.txt" "assets.json" "LICENSE" "THIRD_PARTY.md" ]
           ) ./.;
         };
         nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -64,6 +64,8 @@
           share=$out/share/artemis-emu
           mkdir -p $share $out/bin
           cp -r artemis_emu examples tests $share/
+          mkdir -p $out/share/doc/artemis-emu
+          cp LICENSE THIRD_PARTY.md $out/share/doc/artemis-emu/
           env=(
             --set PYTHONPATH $share
             --set ARTEMIS_QEMU ${qemu.final}/bin/qemu-system-xtensa
@@ -81,6 +83,7 @@
         meta = {
           description = "Emulator for the CircuitMess NASA Artemis Watch 2.0";
           mainProgram = "artemis-emu";
+          license = pkgs.lib.licenses.gpl2Plus;
           platforms = [ system ];
         };
       };

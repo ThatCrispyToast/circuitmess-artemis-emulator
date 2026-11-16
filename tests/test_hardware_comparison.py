@@ -811,9 +811,10 @@ Pin(8, Pin.IN, None)
 print(out)
 """)
     assert seen == {
-        "a quarter": (0.25, 400.0),
+        # Polling intervals vary, so sampled duty has a two-percentage-point tolerance.
+        "a quarter": (pytest.approx(0.25, abs=0.02), 400.0),
         "read back at once": 16384,
-        "three quarters": (0.75, 400.0),
+        "three quarters": (pytest.approx(0.75, abs=0.02), 400.0),
         "off": (0.0, 0.0),
         "full": (1.0, 0.0),
         "after deinit": (0.0, 0.0),

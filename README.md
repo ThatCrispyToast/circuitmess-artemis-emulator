@@ -116,6 +116,6 @@ The emulator extends [Espressif's QEMU fork](https://github.com/espressif/qemu) 
 
 This project uses [QEMU](https://www.qemu.org), Espressif's fork, and CircuitMess's [stock firmware](https://github.com/CircuitMess/GC_Artemis-Firmware) and [MicroPython](https://github.com/CircuitMess/micropython). Firmware images are not stored in this repository.
 
-The device models and patch under `qemu/` are licensed under GPL-2.0-or-later, matching QEMU.
+This project's original code, examples, documentation, and build scripts are licensed under [GPL-2.0-or-later](LICENSE). Third-party components retain their own licenses; see [third-party notices and sources](THIRD_PARTY.md).
 
 This is an independent project, not affiliated with or endorsed by CircuitMess or NASA.

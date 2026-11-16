@@ -5,7 +5,8 @@
 #   qemu/tools/build.sh                  build it and install it where the emulator looks
 #   qemu/tools/build.sh --prefix DIR     install it in DIR instead
 #   qemu/tools/build.sh --bundle FILE    pack it as FILE with the libraries it uses, to
-#                                        run on other computers (needs patchelf too)
+#                                        run on other computers (Ubuntu/Debian; needs
+#                                        patchelf, dpkg-dev, and deb-src repositories)
 #
 # Needs a C compiler, make, ninja, pkg-config, python3 with venv, curl and patch, and the
 # development files of glib, libgcrypt, pixman, libslirp and zlib; docs/install.md has
@@ -102,10 +103,13 @@ directory of https://github.com/ThatCrispyToast/circuitmess-artemis-emulator, bu
 by qemu/tools/build.sh there. QEMU is licensed under the GNU GPL, version 2; see
 COPYING, COPYING.LIB and LICENSE here.
 
-lib/ holds the libraries it was built against, unmodified, from the distribution it
-was built on: GLib and its PCRE (LGPL), libgcrypt and libgpg-error (LGPL), pixman
-(MIT), libslirp (BSD) and zlib. Their source is that distribution's.
+Bundled library versions and source packages are recorded in libraries.json.
+Their copyright notices and license texts are in libraries/ and common-licenses/.
+The matching QEMU and library source archives are published alongside this binary
+at https://github.com/ThatCrispyToast/circuitmess-artemis-emulator/releases.
 NOTE
+
+python3 "$root/qemu/tools/package-sources.py" "$root" "$PWD" "$stage" "$bundle"
 
 tar -C "$stage" --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
     -cJf "$bundle" bin lib share

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Emulator for the CircuitMess NASA Artemis Watch 2.0"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "GPL-2.0-or-later"
+license-files = ["LICENSE", "THIRD_PARTY.md"]
 dependencies = [
     # 6.12.0 miscounts references to None on Pythons before 3.12, and crashes there.
     "PySide6-Essentials>=6.8; python_version >= '3.12'",
@@ -23,6 +25,11 @@ test = ["pytest"]
 
 [project.scripts]
 artemis-emu = "artemis_emu.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/ThatCrispyToast/circuitmess-artemis-emulator"
+Issues = "https://github.com/ThatCrispyToast/circuitmess-artemis-emulator/issues"
+Documentation = "https://github.com/ThatCrispyToast/circuitmess-artemis-emulator/tree/main/docs"
 
 [tool.setuptools]
 packages = ["artemis_emu"]

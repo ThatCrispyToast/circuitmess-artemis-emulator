@@ -71,6 +71,27 @@ def test_download_rejects_hash_mismatch(served, monkeypatch):
     assert not list((assets.home() / "firmware").iterdir())
 
 
+def test_micropython_download_includes_notices(served, monkeypatch):
+    entry = pin(monkeypatch, "micropython", b"an image")
+    notices = b"MicroPython and third-party licenses"
+    entry["notices"] = {"file": "micropython-NOTICES.txt", "sha256": hashlib.sha256(notices).hexdigest()}
+    (served / entry["file"]).write_bytes(b"an image")
+    (served / entry["notices"]["file"]).write_bytes(notices)
+    path = micropython_firmware()
+    assert path.read_bytes() == b"an image"
+    assert path.with_name(entry["notices"]["file"]).read_bytes() == notices
+
+
+def test_micropython_rejects_invalid_notices(served, monkeypatch):
+    entry = pin(monkeypatch, "micropython", b"an image")
+    entry["notices"] = {"file": "micropython-NOTICES.txt", "sha256": hashlib.sha256(b"expected").hexdigest()}
+    (served / entry["file"]).write_bytes(b"an image")
+    (served / entry["notices"]["file"]).write_bytes(b"changed")
+    with pytest.raises(FirmwareNotFound, match="isn't the file expected"):
+        micropython_firmware()
+    assert not (assets.home() / "firmware" / entry["file"]).exists()
+
+
 def test_download_error_includes_url(served, monkeypatch):
     pin(monkeypatch, "micropython", b"an image")
     with pytest.raises(FirmwareNotFound, match="couldn't download .*127.0.0.1.*404"):

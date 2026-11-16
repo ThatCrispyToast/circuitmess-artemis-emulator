@@ -114,6 +114,9 @@ def qemu() -> Path:
 def micropython_firmware() -> Path:
     """This project's build of CircuitMess's MicroPython."""
     entry = PINS["micropython"]
+    if "notices" in entry:
+        notices = entry["notices"]
+        _published(notices, home() / "firmware" / notices["file"], "MicroPython license notices")
     return _published(entry, home() / "firmware" / entry["file"], "MicroPython for the watch")
 
 

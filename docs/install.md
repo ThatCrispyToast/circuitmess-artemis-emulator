@@ -8,9 +8,9 @@ Install Python 3.10 or later, `git`, and Qt's graphics and audio dependencies:
 
 | Distribution | Packages |
 | --- | --- |
-| Ubuntu, Debian | `sudo apt install -y git python3-venv libegl1 libgl1 libfontconfig1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libwayland-cursor0 libpulse0 fonts-dejavu-core` |
-| Fedora | `sudo dnf install -y git python3 mesa-libEGL mesa-libGL libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-keysyms xcb-util-image xcb-util-renderutil libwayland-cursor pulseaudio-libs dejavu-sans-fonts` |
-| Arch | `sudo pacman -S --needed git python libglvnd libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-keysyms xcb-util-image xcb-util-renderutil wayland libpulse fontconfig ttf-dejavu` |
+| Ubuntu, Debian | `sudo apt install -y git python3-venv libegl1 libgl1 libglib2.0-0 libfontconfig1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libwayland-cursor0 libpulse0 fonts-dejavu-core` |
+| Fedora | `sudo dnf install -y git python3 glib2 mesa-libEGL mesa-libGL libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-keysyms xcb-util-image xcb-util-renderutil libwayland-cursor pulseaudio-libs dejavu-sans-fonts` |
+| Arch | `sudo pacman -S --needed git python glib2 libglvnd libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-keysyms xcb-util-image xcb-util-renderutil wayland libpulse fontconfig ttf-dejavu` |
 
 Desktop installations may already include these libraries. The emulator reports missing libraries at startup. `--headless` does not require the graphics or audio libraries.
 
@@ -58,7 +58,7 @@ The script downloads the pinned Espressif QEMU release, applies this project's d
 | Fedora | `sudo dnf install -y gcc make ninja-build pkgconf-pkg-config python3 curl patch glib2-devel libgcrypt-devel pixman-devel libslirp-devel zlib-ng-compat-devel` |
 | Arch | `sudo pacman -S --needed base-devel ninja python curl patch glib2 libgcrypt pixman libslirp zlib` |
 
-`qemu/tools/build.sh --bundle FILE` packages QEMU with its libraries. Published builds use this command on Ubuntu 22.04.
+`qemu/tools/build.sh --bundle FILE` packages QEMU with its libraries, notices, and corresponding sources. It requires Ubuntu or Debian with `patchelf`, `dpkg-dev`, and `deb-src` repositories enabled. See the [release instructions](releasing.md) for the Ubuntu 22.04 build environment.
 
 Building MicroPython requires Nix: `nix build .#micropython-firmware`. The build pins ESP-IDF and the compiler.
 

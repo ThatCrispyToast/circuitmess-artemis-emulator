@@ -60,3 +60,9 @@ with Device() as watch:
 artemis-emu device flash micropython
 ARTEMIS_TEST_ON_WATCH=1 python -m pytest tests/test_hardware_comparison.py
 ```
+
+## Project checks
+
+Run `python -m pytest -q tests` for the full suite. Hardware timing comparisons require native Linux; virtual machines can exceed their tolerances, as described in [the accuracy guide](accuracy.md).
+
+GitHub Actions checks package installation, first-use downloads, the GUI under Xvfb, and the functional suite on Ubuntu 22.04 / Python 3.10 and Ubuntu 24.04 / Python 3.12. It excludes `test_hardware_comparison.py` because the hosted runners are virtual machines. Release validation runs the full suite on native Linux.
