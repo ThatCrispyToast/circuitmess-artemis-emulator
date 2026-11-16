@@ -34,10 +34,6 @@ os.environ.setdefault("ARTEMIS_TEST_STOCK", os.environ.get("ARTEMIS_STOCK_FIRMWA
 STOCK = os.environ.get("ARTEMIS_STOCK_FIRMWARE")
 MICROPYTHON = os.environ.get("ARTEMIS_MICROPYTHON_FIRMWARE")
 
-# The firmware plays its intro for about nine seconds before the lock screen.
-BOOT_TIME = 14
-
-
 @pytest.fixture(autouse=True)
 def time_limit():
     """Fails a test whose firmware hangs instead of stalling the whole run."""
@@ -64,9 +60,17 @@ def booted(stock):
     """Stock firmware that has finished booting and is showing the lock screen."""
     stock.wait_for_output("Hello", timeout=10)
     stock.wait_until(lambda: stock.state.frame_seq > 0, timeout=10)
-    import time
 
-    time.sleep(BOOT_TIME)
+    def lock_screen_visible():
+        frame = stock.frame()
+        # Borders and empty rows distinguish the default lock screen from the intro.
+        rows = ((30, b"\x20\xfb"), (31, b"\0\0"),
+                (83, b"\x20\xfb"), (90, b"\0\0"))
+        return all(frame[(y * 128 + 2) * 2:(y * 128 + 126) * 2] == color * 124
+                   for y, color in rows)
+
+    stock.wait_until(lock_screen_visible, timeout=45, interval=0.1)
+    stock.wait_until_display_settles()
     return stock
 
 
