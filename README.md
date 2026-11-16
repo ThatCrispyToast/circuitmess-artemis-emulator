@@ -1,6 +1,6 @@
 # Artemis Watch emulator
 
-A QEMU-based emulator for the [CircuitMess NASA Artemis Watch 2.0](https://circuitmess.com/products/nasa-artemis-watch-2-0) that runs its unmodified ESP32-S3 firmware.
+A QEMU-based emulator for the [CircuitMess NASA Artemis Watch 2.0](https://circuitmess.com/products/nasa-artemis-watch-2-0) capable of running its unmodified ESP32-S3 firmware.
 
 <p align="center">
   <img src="docs/images/emulator.gif" width="760"
@@ -83,14 +83,15 @@ The API can control buttons, motion, and battery state, and read pixels, LEDs, b
 
 ## Accuracy
 
-[`tests/test_like_a_watch.py`](tests/test_like_a_watch.py) checks the emulator against measurements from a hardware revision 2 watch. The same tests can run on the watch.
+Hardware measurements come from one revision 2 watch running this project's MicroPython. Emulator measurements use native Linux. [`tests/test_like_a_watch.py`](tests/test_like_a_watch.py) can run on either target.
 
 | Metric | Comparison with hardware |
 | --- | --- |
 | Execution speed | 17 of 27 MicroPython operations within 3%, all within 11% |
-| Sleeps and timers | Within microseconds; UART and PWM rates match |
-| Registers | 1994 of 2004 register values match |
-| Resets and watchdogs | Matching causes, timing, and retained state |
+| Idle-core tick wake-up delay | Worst observed: 60 µs in the emulator, 23 µs on hardware |
+| UART transmission | Tested at 1,200, 9,600, 115,200, and 921,600 baud; test tolerance is ±3% of nominal transmission time or ±0.4 ms, whichever is larger |
+| Registers after MicroPython startup | 1994 of 2004 stable register values match (99.5%); the 10 differences are in the flash controller |
+| RTC watchdog resets | Hardware baselines of 200, 400, and 798 ms; test tolerance is ±2% or ±6 ms, whichever is larger |
 
 See [emulation coverage and measurements](docs/accuracy.md) for details.
 
