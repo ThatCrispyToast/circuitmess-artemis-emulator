@@ -1,32 +1,44 @@
-# How it's put together
+# Internals
 
-```
-pyproject.toml          the Python package: command line, window, real-watch support, and the API
-artemis_emu/            its code; assets.json pins what it downloads
-qemu/overlay/           the watch's devices and the chip's missing ones, added to QEMU's source tree
-qemu/patches/           wires them into the ESP32-S3 machine, paces the CPUs, and fixes the model where it differs from the chip
-qemu/tools/             builds that QEMU, generates the table of register reset values from ESP-IDF's headers, and unpacks the patch for editing
-flake.nix               the same as Nix packages, built from source, and a development shell
-nix/qemu.nix            Espressif's QEMU, plus the two directories above
-nix/micropython.nix     CircuitMess's MicroPython, with its pinned toolchain and ESP-IDF
-examples/               MicroPython programs
-tests/                  runs the stock firmware, MicroPython, the examples and the command line; test_like_a_watch.py runs on a watch too
-```
+## Source layout
 
-QEMU and the front end talk over a small protocol on a Unix socket, documented at the top of `qemu/overlay/hw/artemis/board.c`. The serial ports and QMP are Unix sockets too, in a temporary directory per run.
+| Path | Contents |
+| --- | --- |
+| `pyproject.toml` | Python package metadata, dependencies, and CLI entry point |
+| `artemis_emu/` | CLI, GUI, test API, and USB device tools; `assets.json` pins downloads |
+| `qemu/overlay/` | Watch and ESP32-S3 device models added to QEMU's source tree |
+| `qemu/patches/` | ESP32-S3 integration, CPU pacing, and corrections to existing device models |
+| `qemu/tools/` | Build scripts, register table generator, and patch editing tools |
+| `flake.nix` | Nix packages, test runner, and development shell |
+| `nix/qemu.nix` | Espressif QEMU build with the overlay and patches |
+| `nix/micropython.nix` | CircuitMess MicroPython build with pinned ESP-IDF and compiler |
+| `examples/` | MicroPython programs |
+| `tests/` | Firmware, example, API, CLI, and GUI tests; `test_like_a_watch.py` also runs on hardware |
+
+QEMU and the Python front end communicate over a Unix socket. The protocol is documented at the top of [`board.c`](../qemu/overlay/hw/artemis/board.c). Serial ports and QMP use separate Unix sockets in a temporary directory for each run.
+
+The GUI uses Qt through PySide6, with native desktop styling and the same `Watch` API as the tests.
 
 ## Timing
 
-The CPUs are paced by counting instructions: each core runs a few microseconds' worth, then waits for the clock. The clock stands still while QEMU translates code or runs a device model, since neither takes the chip any time, and a register access is charged what it costs on the chip. Cores that are waiting run timers the moment they fall due, so interrupts aren't late by however long a sleeping thread takes to wake. `--turbo` turns all of that off.
+CPU pacing counts instructions. Each core executes a few microseconds of guest code, then waits for the clock to catch up. Guest time excludes host work such as code translation and device model execution. Register accesses add delays based on hardware measurements.
 
-The window is Qt, through PySide6, in your desktop's own style, on top of the same `Watch` object the tests use.
+Idle cores process timers as they become due, reducing interrupt delays caused by host thread scheduling. `--turbo` disables CPU pacing.
 
-## Working on it
+## Development
 
-`pip install -e '.[test]'` in a virtual environment installs the emulator from the checkout with pytest, and `python -m pytest tests` runs its tests. After a change under `qemu/`, `qemu/tools/build.sh` builds a QEMU the emulator then uses instead of the published one; [install.md](install.md) has what that needs. `nix develop` gives a shell with all of it built from source, and `nix run .#test` runs the tests against that.
+In a virtual environment, run `pip install -e '.[test]'` for an editable installation with pytest. Run the tests with `python -m pytest tests`.
 
-The patch to QEMU's own files is a diff, and is edited as the two trees it is the difference of: `qemu/tools/patch-trees.sh unpack DIR`, change files under `DIR/b`, then `pack DIR`. New devices go in `qemu/overlay/` and need no patch.
+After changing `qemu/`, rebuild with `qemu/tools/build.sh`. The emulator automatically uses the local build. See [build dependencies](install.md#building-qemu). Alternatively, `nix develop` provides dependencies and source builds, and `nix run .#test` runs tests against the Nix packages.
 
-`qemu/overlay/hw/artemis/soc_registers.h` is generated: `python3 qemu/tools/gen-soc-registers.py /path/to/esp-idf > qemu/overlay/hw/artemis/soc_registers.h`.
+To edit the QEMU patch:
 
-Nix flakes only see files tracked by Git, so `git add` new files before building with it.
+1. Run `qemu/tools/patch-trees.sh unpack DIR` to create the original tree at `DIR/a` and patched tree at `DIR/b`.
+2. Edit files under `DIR/b`.
+3. Run `qemu/tools/patch-trees.sh pack DIR` to regenerate the patch.
+
+New device models go in `qemu/overlay/`. Changes to QEMU's existing files go in the patch.
+
+Generate `qemu/overlay/hw/artemis/soc_registers.h` from ESP-IDF headers with `python3 qemu/tools/gen-soc-registers.py /path/to/esp-idf > qemu/overlay/hw/artemis/soc_registers.h`.
+
+Nix flakes in a Git checkout exclude untracked files. Stage new files with `git add` before building.

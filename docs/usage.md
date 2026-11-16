@@ -3,81 +3,82 @@
 ## Commands
 
 ```sh
-artemis-emu stock                      # CircuitMess's factory firmware
-artemis-emu python examples/hello.py   # a MicroPython program
-artemis-emu repl                       # a MicroPython prompt (Ctrl-] quits)
-artemis-emu run firmware.bin           # a firmware you built
+artemis-emu stock                     # CircuitMess's factory firmware
+artemis-emu python examples/hello.py  # run a MicroPython program
+artemis-emu repl                      # MicroPython prompt (Ctrl-] quits)
+artemis-emu run firmware.bin          # custom firmware
 ```
 
-`run` accepts a merged flash image, a bare application image (placed behind the stock firmware's bootloader and partition table), or an ESP-IDF project or build directory. `stock` runs CircuitMess's latest release; `--version 2.0`, `2.1`, `2.1.1` or `2.2` picks another.
+`run` accepts a merged flash image, a bare application image, or an ESP-IDF project or build directory. Bare applications use the stock firmware's bootloader and partition table. `stock` defaults to the newest supported CircuitMess release; select a version with `--version 2.0`, `2.1`, `2.1.1`, or `2.2`.
 
-Options, for any of these commands:
+Common options:
 
 | Option | Effect |
 | --- | --- |
-| `--headless` | no window; a `python` run ends when the script does |
-| `--timeout SECONDS` | stop after this long |
-| `--screenshot FILE.png` | save the display on exit |
-| `--flash FILE` | keep flash (settings, files, NVS) in a file between runs |
-| `--time 2026-07-20T20:17:00` | set the clock; the default is your local time, and `unset` is a clock that was never set, as a new watch has |
-| `--battery MV`, `--usb`, `--charging` | start with this power supply |
-| `--revision 2` | emulate hardware revision 2 instead of 3 |
-| `--turbo` | run code as fast as your computer can, instead of at the chip's speed |
-| `--sensor-noise` | give the motion sensor the noise a real one has |
-| `--mute` | don't play the buzzer |
-| `--no-watchdogs` | keep watchdogs from firing, for debugging a hang |
-| `--gdb PORT`, `--wait-gdb` | open a GDB stub, optionally waiting for it before starting |
+| `--headless` | Run without a window; `python` exits when the script finishes, unless `--install` is set |
+| `--timeout SECONDS` | Stop after the specified duration |
+| `--screenshot FILE.png` | Save the display on exit |
+| `--flash FILE` | Persist flash contents, including settings, files, and NVS, between runs |
+| `--time 2026-07-20T20:17:00` | Set the RTC; defaults to local time. Use `unset` for an uninitialized clock |
+| `--battery MV`, `--usb`, `--charging` | Set initial battery voltage, USB connection, and charging state |
+| `--revision 2` | Emulate hardware revision 2; the default is 3 |
+| `--turbo` | Disable CPU pacing and run at the host's maximum speed |
+| `--sensor-noise` | Add noise to motion sensor readings |
+| `--mute` | Mute the buzzer |
+| `--no-watchdogs` | Disable watchdogs when debugging hangs |
+| `--gdb PORT`, `--wait-gdb` | Start a GDB stub; optionally wait for the debugger to resume execution |
 
-`python` also takes `--install`, which stores the script as `main.py` so that it runs at every boot, the way a program from CircuitBlocks does:
+Use `python --install` to save a script as `main.py` and run it at boot. `--flash` preserves the file between emulator runs:
 
 ```sh
 artemis-emu python my_program.py --install --flash my_watch.bin
-artemis-emu repl --flash my_watch.bin   # boots into main.py; Ctrl-C for a prompt
+artemis-emu repl --flash my_watch.bin  # boots into main.py; Ctrl-C for a prompt
 ```
 
-## In the window
+## Window controls
 
 | Input | Effect |
 | --- | --- |
-| Left, Right | lever |
-| Enter or Space | push the lever in |
-| Esc or Backspace | side button |
-| W A S D, `0` | tilt the watch, level it |
-| `T` | tap |
-| `R` | reset (cuts power) |
-| `M` | mute |
-| F12 | screenshot |
+| Left, Right | Move the lever |
+| Enter or Space | Press the lever |
+| Esc or Backspace | Press the side button |
+| W A S D | Tilt the watch |
+| `0` | Reset tilt to level |
+| `T` | Tap |
+| `R` | Reset by cycling power |
+| `M` | Toggle mute |
+| F12 | Save a screenshot |
 
-The side panel has the same controls for the mouse: the lever and button, sliders for pitch and roll, tap, double tap and steps, and the battery voltage, USB cable and charging.
+The side panel provides mouse controls for the lever, button, pitch, roll, single and double taps, steps, battery voltage, USB connection, and charging.
 
 ## Hardware revisions
 
-Watches come in two revisions, with different displays. Revision 2 shipped with firmware 2.0; revision 3 needs 2.1 or later, and refuses 2.0. The emulator defaults to 3. `device info` says which a real watch is.
+The two hardware revisions use different displays. Revision 2 shipped with firmware 2.0. Revision 3 requires firmware 2.1 or later and rejects 2.0. The emulator defaults to revision 3; `device info` reports a connected watch's revision.
 
 ## With a real watch
 
-Plug the watch in over USB and the same commands work on it:
+Connect the watch over USB. Back up its flash before changing the firmware:
 
 ```sh
-artemis-emu device info                        # chip, revision, and what firmware it's running
-artemis-emu device backup my-watch.bin         # save its whole flash, and do this first
-artemis-emu device flash micropython           # put this project's MicroPython on it
-artemis-emu python examples/hello.py --device  # run a program on the watch
+artemis-emu device info                        # chip, hardware revision, and firmware
+artemis-emu device backup my-watch.bin         # save the full flash
+artemis-emu device flash micropython           # install this project's MicroPython build
+artemis-emu python examples/hello.py --device  # run a program
 artemis-emu repl --device
-artemis-emu device monitor --reset             # watch it boot
-artemis-emu device flash stock --version 2.0   # a CircuitMess release
-artemis-emu device restore my-watch.bin        # exactly as it was
+artemis-emu device monitor --reset             # restart and show the serial console
+artemis-emu device flash stock --version 2.0   # install a stock release
+artemis-emu device restore my-watch.bin        # restore the backup
 ```
 
-`device flash` also takes a firmware file. Flashing MicroPython keeps a MicroPython filesystem that is already on the watch, and clears whatever another firmware left where it goes; `--erase-files` starts clean either way. With several watches plugged in, `--port` picks one.
+`device flash` also accepts a firmware file. Flashing MicroPython preserves an existing MicroPython filesystem; otherwise, it erases the filesystem region. Add `--erase-files` to start with an empty filesystem. Use `--port` to select a watch when several are connected.
 
-Your user needs access to the watch's serial port, which is an Espressif USB Serial/JTAG device (`303a:1001`). On most distributions that means joining the group that owns serial ports, and logging in again:
+The watch uses an Espressif USB Serial/JTAG device (`303a:1001`). To access its serial port, join the serial-port group and log in again:
 
 ```sh
-sudo usermod -aG dialout $USER   # the group is uucp on Arch
+sudo usermod -aG dialout $USER  # the group is uucp on Arch
 ```
 
-On NixOS, a udev rule does it:
+On NixOS, grant access with a udev rule:
 
 ```nix
 services.udev.packages = [
@@ -87,10 +88,10 @@ services.udev.packages = [
 ];
 ```
 
-Under WSL, the watch has to be handed from Windows to Linux first, with [usbipd-win](https://github.com/dorssel/usbipd-win). That route hasn't been tried with this project.
+WSL requires [usbipd-win](https://github.com/dorssel/usbipd-win) to attach the USB device to Linux. This setup is untested with the emulator's device tools.
 
 ## Firmware
 
-The MicroPython firmware is built from [CircuitMess's source](https://github.com/CircuitMess/micropython) for the board they maintain for their ESP32-S3 devices, unchanged. It keeps files in a FAT partition in the upper half of flash, so a program installed as `main.py` survives a power cycle, here and on a watch. Its CPU runs at ESP-IDF's default 160 MHz.
+MicroPython is built from unmodified [CircuitMess source](https://github.com/CircuitMess/micropython) using their ESP32-S3 board definition. Files occupy a FAT partition in the upper half of flash. An installed `main.py` survives power cycles on hardware and in persistent emulator flash images. The CPU runs at 160 MHz by default.
 
-The stock firmware is downloaded from [CircuitMess's releases](https://github.com/CircuitMess/GC_Artemis-Firmware/releases) when needed, not kept here.
+Stock firmware is downloaded from [CircuitMess's releases](https://github.com/CircuitMess/GC_Artemis-Firmware/releases) on first use. Firmware images are not stored in this repository.
