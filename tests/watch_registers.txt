@@ -1,6 +1,6 @@
 # ESP32-S3 registers as a watch (hardware revision 2, on USB) has them once MicroPython
 # has started: those that read the same after every whole-chip reset. Written, with a watch
-# plugged in, by: nix develop -c python -m tests.test_like_a_watch
+# plugged in, by: nix develop -c python -m tests.test_hardware_comparison
 SYSTEM+000 00000002
 SYSTEM+004 00000000
 SYSTEM+008 00000040

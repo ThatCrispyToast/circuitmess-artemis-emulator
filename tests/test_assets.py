@@ -52,7 +52,7 @@ def bundle(*names):
     return data.getvalue()
 
 
-def test_firmware_is_fetched_once_and_kept(served, monkeypatch):
+def test_firmware_download_cache(served, monkeypatch):
     entry = pin(monkeypatch, "micropython", b"an image")
     (served / entry["file"]).write_bytes(b"an image")
     path = micropython_firmware()
@@ -63,7 +63,7 @@ def test_firmware_is_fetched_once_and_kept(served, monkeypatch):
     assert micropython_firmware() == path
 
 
-def test_file_that_is_not_the_one_pinned_is_refused(served, monkeypatch):
+def test_download_rejects_hash_mismatch(served, monkeypatch):
     entry = pin(monkeypatch, "micropython", b"an image")
     (served / entry["file"]).write_bytes(b"something else")
     with pytest.raises(FirmwareNotFound, match="isn't the file expected"):
@@ -71,13 +71,13 @@ def test_file_that_is_not_the_one_pinned_is_refused(served, monkeypatch):
     assert not list((assets.home() / "firmware").iterdir())
 
 
-def test_missing_file_says_where_it_looked(served, monkeypatch):
+def test_download_error_includes_url(served, monkeypatch):
     pin(monkeypatch, "micropython", b"an image")
     with pytest.raises(FirmwareNotFound, match="couldn't download .*127.0.0.1.*404"):
         micropython_firmware()
 
 
-def test_named_files_are_used_as_they_are(served, monkeypatch, tmp_path):
+def test_asset_path_overrides(served, monkeypatch, tmp_path):
     monkeypatch.setenv("ARTEMIS_MICROPYTHON_FIRMWARE", str(tmp_path / "mine.bin"))
     monkeypatch.setenv("ARTEMIS_STOCK_FIRMWARE", str(tmp_path / "theirs.bin"))
     monkeypatch.setenv("ARTEMIS_QEMU", str(tmp_path / "qemu"))
@@ -86,7 +86,7 @@ def test_named_files_are_used_as_they_are(served, monkeypatch, tmp_path):
     assert assets.qemu() == tmp_path / "qemu"
 
 
-def test_published_qemu_is_unpacked_where_it_runs_from(served, monkeypatch):
+def test_qemu_bundle_extraction_and_cache(served, monkeypatch):
     data = bundle("bin/qemu-system-xtensa", "share/qemu/esp32s3_rev0_rom.bin")
     entry = pin(monkeypatch, "qemu", data)
     (served / entry["file"]).write_bytes(data)
@@ -99,7 +99,7 @@ def test_published_qemu_is_unpacked_where_it_runs_from(served, monkeypatch):
     assert assets.qemu() == binary
 
 
-def test_qemu_built_here_comes_before_the_published_one(served, monkeypatch):
+def test_local_qemu_precedes_published_build(served, monkeypatch):
     pin(monkeypatch, "qemu", b"never fetched")
     built = assets.home() / "qemu" / "bin" / "qemu-system-xtensa"
     built.parent.mkdir(parents=True)
@@ -107,7 +107,7 @@ def test_qemu_built_here_comes_before_the_published_one(served, monkeypatch):
     assert assets.qemu() == built
 
 
-def test_unpublished_qemu_points_at_the_build_script(served, monkeypatch):
+def test_missing_qemu_error_includes_build_command(served, monkeypatch):
     pin(monkeypatch, "qemu", b"not there")
     with pytest.raises(assets.AssetError, match="qemu/tools/build.sh"):
         assets.qemu()
@@ -116,12 +116,12 @@ def test_unpublished_qemu_points_at_the_build_script(served, monkeypatch):
         assets.qemu()
 
 
-def test_unknown_stock_version_is_named_with_the_ones_there_are(served):
+def test_unknown_stock_version_lists_supported_releases(served):
     with pytest.raises(FirmwareNotFound, match="2.0, 2.1, 2.1.1, 2.2"):
         stock_firmware("9.9")
 
 
-def test_stock_releases_are_recognised_without_their_files(served):
+def test_stock_release_identification_from_image(served):
     stock = os.environ.get("ARTEMIS_TEST_STOCK")
     if not stock:
         pytest.skip("no stock firmware at hand")

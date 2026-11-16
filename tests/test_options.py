@@ -35,26 +35,26 @@ def script(tmp_path, code):
 @pytest.mark.parametrize("version, revision",
                          [(version, 2) for version in STOCK_VERSIONS] +
                          [(version, 3) for version in STOCK_VERSIONS if version != "2.0"])
-def test_each_release_starts_on_the_hardware_it_supports(version, revision):
+def test_stock_release_hardware_compatibility(version, revision):
     with Watch(stock_firmware(version), revision=revision) as watch:
         watch.wait_for_output("Hello", timeout=15)
         watch.wait_until(lambda: watch.backlight > 0.9, timeout=15)
 
 
 @needs_stock
-def test_the_first_release_refuses_hardware_newer_than_it():
+def test_stock_2_0_rejects_revision_3():
     with Watch(stock_firmware("2.0"), revision=3) as watch:
         watch.wait_for_output("Hardware check", timeout=15)
 
 
 @needs_stock
-def test_command_runs_the_release_asked_for():
+def test_stock_cli_version_selection():
     result = emu("stock", "--version", "2.0", "--revision", "2", "--headless", "--mute", "--timeout", "4")
     assert result.returncode == 0, result.stderr
     assert "ESP-ROM:esp32s3" in result.stdout
 
 
-def test_command_names_the_releases_it_has():
+def test_stock_cli_lists_supported_versions():
     result = emu("stock", "--version", "1.0", "--headless")
     assert result.returncode != 0
     assert "2.2" in result.stderr
@@ -76,14 +76,14 @@ print(loop())
 
 
 @needs_micropython
-def test_turbo_runs_code_faster_than_the_chip_would():
+def test_turbo_execution_speed():
     with Watch(MICROPYTHON, turbo=True) as watch:
         took_us = int(PythonSession(watch).run(LOOP))
     assert took_us < 60000          # 106 ms on a watch, and without turbo
 
 
 @needs_micropython
-def test_turbo_from_the_command_line(tmp_path):
+def test_turbo_cli_option(tmp_path):
     result = emu("python", script(tmp_path, LOOP), "--turbo", "--headless", "--mute")
     assert result.returncode == 0, result.stderr
     assert int(result.stdout) < 60000
@@ -99,13 +99,13 @@ print(i2c.readfrom_mem(0x51, 2, 1)[0] >> 7)
 @needs_micropython
 @pytest.mark.parametrize("time, lost_power", [("unset", 1), (None, 0),
                                               (dt.datetime(2026, 7, 20, 20, 17), 0)])
-def test_the_clock_chip_knows_whether_it_was_ever_set(time, lost_power):
+def test_rtc_initialization_flag(time, lost_power):
     with Watch(MICROPYTHON, time=time) as watch:
         assert int(PythonSession(watch).run(CLOCK_FLAG)) == lost_power
 
 
 @needs_micropython
-def test_unset_clock_from_the_command_line(tmp_path):
+def test_unset_rtc_cli_option(tmp_path):
     result = emu("python", script(tmp_path, CLOCK_FLAG), "--time", "unset", "--headless", "--mute")
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "1"
@@ -127,7 +127,7 @@ print(len(seen))
 
 @needs_micropython
 @pytest.mark.parametrize("noise", [False, True])
-def test_sensor_noise_is_there_when_asked_for(noise):
+def test_sensor_noise_option(noise):
     with Watch(MICROPYTHON, sensor_noise=noise) as watch:
         watch.set_motion(accel_g=(0.0, 0.0, 1.0))
         different = int(PythonSession(watch).run(ACCELEROMETER_READINGS))
@@ -140,7 +140,7 @@ def test_sensor_noise_is_there_when_asked_for(noise):
 
 @pytest.mark.parametrize("command", [("device", "info"), ("device", "monitor"), ("repl", "--device"),
                                      ("device", "backup", "nowhere.bin")])
-def test_commands_for_a_watch_say_when_there_is_none(command):
+def test_device_commands_report_missing_port(command):
     port = ["/dev/no-such-watch"] if command[0] == "repl" else ["--port", "/dev/no-such-watch"]
     result = emu(*command, *port, timeout=30)
     assert result.returncode == 1

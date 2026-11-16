@@ -54,9 +54,9 @@ with Device() as watch:
     print(PythonSession(watch).run("import os; print(os.uname().machine)"))
 ```
 
-[`tests/test_like_a_watch.py`](../tests/test_like_a_watch.py) checks hardware measurements and runs on the emulator by default. To run it on a watch, install this project's MicroPython and set `ARTEMIS_TEST_ON_WATCH=1`:
+[`tests/test_hardware_comparison.py`](../tests/test_hardware_comparison.py) checks hardware measurements and runs on the emulator by default. To run it on a watch, install this project's MicroPython and set `ARTEMIS_TEST_ON_WATCH=1`:
 
 ```sh
 artemis-emu device flash micropython
-ARTEMIS_TEST_ON_WATCH=1 python -m pytest tests/test_like_a_watch.py
+ARTEMIS_TEST_ON_WATCH=1 python -m pytest tests/test_hardware_comparison.py
 ```

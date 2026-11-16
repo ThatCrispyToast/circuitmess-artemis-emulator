@@ -83,7 +83,7 @@ The API can control buttons, motion, and battery state, and read pixels, LEDs, b
 
 ## Accuracy
 
-Hardware measurements come from one revision 2 watch running this project's MicroPython. Emulator measurements use native Linux. [`tests/test_like_a_watch.py`](tests/test_like_a_watch.py) can run on either target.
+Hardware measurements come from one revision 2 watch running this project's MicroPython. Emulator measurements use native Linux. [`tests/test_hardware_comparison.py`](tests/test_hardware_comparison.py) can run on either target.
 
 | Metric | Comparison with hardware |
 | --- | --- |

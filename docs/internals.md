@@ -13,7 +13,7 @@
 | `nix/qemu.nix` | Espressif QEMU build with the overlay and patches |
 | `nix/micropython.nix` | CircuitMess MicroPython build with pinned ESP-IDF and compiler |
 | `examples/` | MicroPython programs |
-| `tests/` | Firmware, example, API, CLI, and GUI tests; `test_like_a_watch.py` also runs on hardware |
+| `tests/` | Firmware, example, API, CLI, and GUI tests; `test_hardware_comparison.py` also runs on hardware |
 
 QEMU and the Python front end communicate over a Unix socket. The protocol is documented at the top of [`board.c`](../qemu/overlay/hw/artemis/board.c). Serial ports and QMP use separate Unix sockets in a temporary directory for each run.
 

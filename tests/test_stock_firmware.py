@@ -132,14 +132,14 @@ def test_charging_lights_the_status_led(booted):
     booted.wait_until(lambda: max(booted.rgb_led) < 0.02, timeout=8)
 
 
-def test_battery_level_reaches_the_firmware(booted):
+def test_battery_gauge_updates(booted):
     full = booted.frame()
     booted.set_battery(mv=3620)
     # The on-screen gauge changes once the filtered reading crosses a threshold.
     booted.wait_until(lambda: booted.frame() != full, timeout=40)
 
 
-def test_flat_battery_powers_the_watch_off_and_the_button_restarts_it(booted):
+def test_low_battery_shutdown_and_button_restart(booted):
     booted.set_battery(mv=3200)
     booted.wait_until(lambda: not booted.powered, timeout=90)
 

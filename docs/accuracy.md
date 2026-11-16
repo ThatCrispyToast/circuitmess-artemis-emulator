@@ -20,7 +20,7 @@
 
 ## Hardware comparisons
 
-Measurements compare the emulator on native Linux with one hardware revision 2 watch running this project's MicroPython. [`tests/test_like_a_watch.py`](../tests/test_like_a_watch.py) contains hardware baselines and tests that run on either target. Set `ARTEMIS_TEST_ON_WATCH=1` to run them on a connected watch; see the [testing guide](testing.md#on-a-real-watch).
+Measurements compare the emulator on native Linux with one hardware revision 2 watch running this project's MicroPython. [`tests/test_hardware_comparison.py`](../tests/test_hardware_comparison.py) contains hardware baselines and tests that run on either target. Set `ARTEMIS_TEST_ON_WATCH=1` to run them on a connected watch; see the [testing guide](testing.md#on-a-real-watch).
 
 | Metric | Recorded result |
 | --- | --- |

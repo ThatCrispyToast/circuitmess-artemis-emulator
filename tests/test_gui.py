@@ -46,7 +46,7 @@ def click(window, label):
         (Qt.Key.Key_Backspace, 21),
     ],
 )
-def test_keys_work_the_lever_and_button(micropython, window, key, gpio):
+def test_keyboard_controls_update_gpio(micropython, window, key, gpio):
     QTest.keyPress(window, key)
     assert pin(micropython, gpio) == 1
     QTest.keyRelease(window, key)
@@ -54,21 +54,21 @@ def test_keys_work_the_lever_and_button(micropython, window, key, gpio):
 
 
 @pytest.mark.parametrize("label, gpio", [("Left", 2), ("Right", 1), ("Push", 3), ("Side button", 21)])
-def test_buttons_work_the_lever_and_button(micropython, window, label, gpio):
+def test_mouse_controls_update_gpio(micropython, window, label, gpio):
     QTest.mousePress(window.controls[label], Qt.MouseButton.LeftButton)
     assert pin(micropython, gpio) == 1
     QTest.mouseRelease(window.controls[label], Qt.MouseButton.LeftButton)
     assert pin(micropython, gpio) == 0
 
 
-def test_keys_reach_the_watch_after_a_control_was_clicked(micropython, window):
+def test_keyboard_controls_after_mouse_click(micropython, window):
     click(window, "Tap")
     QTest.keyPress(window, Qt.Key.Key_Space)
     assert pin(micropython, 3) == 1
     QTest.keyRelease(window, Qt.Key.Key_Space)
 
 
-def test_tilt_keys_reach_the_accelerometer(micropython, window):
+def test_tilt_keys_update_accelerometer(micropython, window):
     for _ in range(3):
         QTest.keyClick(window, Qt.Key.Key_W)
     _, y, _ = read(micropython, "Artemis.imu.get_accel()")
@@ -84,7 +84,7 @@ def test_tilt_keys_reach_the_accelerometer(micropython, window):
     )
 
 
-def test_tilt_sliders_reach_the_accelerometer(micropython, window):
+def test_tilt_sliders_update_accelerometer(micropython, window):
     window.roll_slider.setValue(30)
     x, _, _ = read(micropython, "Artemis.imu.get_accel()")
     assert x == pytest.approx(0.5, abs=0.03)
@@ -95,7 +95,7 @@ def test_tilt_sliders_reach_the_accelerometer(micropython, window):
     assert window.roll_slider.value() == 0
 
 
-def test_battery_slider_reaches_the_adc(micropython, window):
+def test_battery_slider_updates_adc(micropython, window):
     window.battery_slider.setValue(3200)
     micropython.run("adc = ADC(Pin(5), atten=ADC.ATTN_11DB)")
     assert read(micropython, "adc.read_uv()") == pytest.approx((3200 - 75) / 4 * 1000, rel=0.03)
@@ -120,7 +120,7 @@ def test_usb_and_charging_controls(micropython, window):
     assert not window.controls["Charging"].isChecked()
 
 
-def test_tap_and_step_controls_do_not_disturb_the_program(micropython, window):
+def test_tap_and_step_controls_preserve_session(micropython, window):
     click(window, "Tap")
     click(window, "Double tap")
     click(window, "+10 steps")
@@ -155,7 +155,7 @@ def pump_for(buzzer, seconds):
     return longest
 
 
-def test_sound_server_that_never_answers_holds_nothing_up(capfd):
+def test_audio_probe_timeout_is_nonblocking(capfd):
     buzzer = Buzzer()
     buzzer.PROBE = "import time\ntime.sleep(60)\n"
     buzzer.PROBE_SECONDS = 0.5
@@ -165,7 +165,7 @@ def test_sound_server_that_never_answers_holds_nothing_up(capfd):
     assert "No sound" in capfd.readouterr().err
 
 
-def test_no_sound_card_is_not_worth_a_word(capfd):
+def test_missing_audio_device_is_silent(capfd):
     buzzer = Buzzer()
     buzzer.PROBE = "import sys\nsys.exit(1)\n"
     assert pump_for(buzzer, 1.0) < 0.25
@@ -173,7 +173,7 @@ def test_no_sound_card_is_not_worth_a_word(capfd):
     assert capfd.readouterr().err == ""
 
 
-def test_muted_buzzer_leaves_the_sound_card_alone():
+def test_disabled_buzzer_skips_audio_probe():
     buzzer = Buzzer(enabled=False)
     pump_for(buzzer, 0.1)
     assert buzzer._probe is None and not buzzer.available
@@ -196,7 +196,7 @@ def shown(window):
     return color.red(), color.green(), color.blue()
 
 
-def test_window_shows_the_display_dimmed_by_the_backlight(micropython, window):
+def test_display_brightness_tracks_backlight(micropython, window):
     micropython.run("d = Artemis.display\nd.fill(d.Color.Red)\nd.commit()")
     red, green, blue = shown(window)
     assert red > 200 and green < 40 and blue < 40
@@ -213,7 +213,7 @@ def test_window_shows_the_leds(micropython, window):
     assert window.lamps[0].shown() != lit
 
 
-def test_window_runs_until_told_to_stop(window):
+def test_window_stop_callback(window):
     frames = []
 
     def stop():

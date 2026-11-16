@@ -44,7 +44,7 @@ def test_session_survives_an_exception(micropython):
     assert micropython.run("print('still here')").strip() == "still here"
 
 
-def test_session_waits_out_a_slow_boot():
+def test_session_waits_for_usb_readiness():
     """However long startup takes the computer, nothing is sent before MicroPython reads."""
     with Watch(FIRMWARE) as watch:
         watch.pause()
@@ -55,43 +55,43 @@ def test_session_waits_out_a_slow_boot():
         assert session.run("print(6 * 7)").strip() == "42"
 
 
-def test_session_gives_up_on_firmware_that_never_reads_its_usb_port():
+def test_session_boot_timeout():
     with Watch(os.environ["ARTEMIS_STOCK_FIRMWARE"]) as watch:
         with pytest.raises(TimeoutError, match="never answered"):
             PythonSession(watch, boot_timeout=3)
 
 
-def test_is_the_circuitmess_build_for_their_s3_devices(micropython):
+def test_circuitmess_board_identification(micropython):
     machine = evaluate(micropython, "__import__('os').uname().machine")
     assert machine == "CircuitMess ESP32S3 Devices with ESP32S3"
     assert evaluate(micropython, "__import__('efuse').read_rev()") == 3
     assert evaluate(micropython, "__import__('efuse').read_pid()") == 3
 
 
-def test_a_big_script_survives_the_serial_link(micropython):
+def test_large_script_transfer(micropython):
     # Longer than any buffer between here and the interpreter.
     lines = "\n".join(f"v{i} = {i}" for i in range(2000))
     assert micropython.run(lines + "\nprint(v1999)").strip() == "1999"
 
 
-def test_large_output_is_not_lost(micropython):
+def test_large_output_transfer(micropython):
     out = micropython.run("for i in range(5000):\n    print(i)")
     assert out.split() == [str(i) for i in range(5000)]
 
 
-def test_script_timeout_interrupts_it(micropython):
+def test_script_timeout_interrupts_execution(micropython):
     with pytest.raises(TimeoutError):
         micropython.run("while True:\n    pass", timeout=1)
     session = PythonSession(micropython.watch)
     assert session.run("print('recovered')").strip() == "recovered"
 
 
-def test_script_that_restarts_the_watch_is_reported(micropython):
+def test_script_reset_raises_watch_restarted(micropython):
     with pytest.raises(WatchRestarted):
         micropython.run("import machine\nmachine.reset()")
 
 
-def test_soft_reset_forgets_variables_and_keeps_the_session(micropython):
+def test_soft_reset_clears_globals_and_preserves_session(micropython):
     micropython.run("forget_me = 1\nimport machine\nmachine.soft_reset()")
     assert evaluate(micropython, "'forget_me' in globals()") is False
     assert evaluate(micropython, "__import__('machine').reset_cause() == __import__('machine').SOFT_RESET")
@@ -107,20 +107,20 @@ def test_cpu_defaults_to_160_mhz(micropython):
 
 
 @pytest.mark.parametrize("mhz", [20, 40, 80, 160, 240])
-def test_cpu_speed_can_be_changed_and_back(micropython, mhz):
+def test_cpu_frequency_changes(micropython, mhz):
     micropython.run(f"import machine\nmachine.freq({mhz}_000_000)", timeout=20)
     assert evaluate(micropython, "machine.freq()") == mhz * 1_000_000
     micropython.run("machine.freq(160_000_000)", timeout=20)
     assert evaluate(micropython, "machine.freq()") == 160_000_000
 
 
-def test_sleep_takes_as_long_as_it_says(micropython):
+def test_sleep_duration(micropython):
     micropython.run("import time\nstart = time.ticks_ms()\ntime.sleep_ms(500)\nend = time.ticks_ms()")
     assert 495 <= evaluate(micropython, "time.ticks_diff(end, start)") <= 560
 
 
 @pytest.mark.parametrize("mhz", [80, 240])
-def test_clock_keeps_up_after_changing_cpu_speed(micropython, mhz):
+def test_clock_accuracy_after_cpu_frequency_change(micropython, mhz):
     micropython.run(
         f"""
 import machine, time
@@ -182,14 +182,14 @@ asyncio.run(main())
 # Display
 
 
-def test_begin_turns_on_a_black_display(micropython):
+def test_begin_initializes_display_and_backlight(micropython):
     micropython.run(SETUP)
     watch = micropython.watch
     assert watch.backlight == 1.0
     assert set(watch.pixels()) == {(0, 0, 0)}
 
 
-def test_display_shows_what_was_drawn_the_right_way_up(micropython):
+def test_display_pixels_and_orientation(micropython):
     micropython.run(
         SETUP
         + """
@@ -212,7 +212,7 @@ d.commit()
     assert at(127, 0) == (0, 0, 0)
 
 
-def test_display_is_upright_on_revision_2():
+def test_revision_2_display_orientation():
     with Watch(FIRMWARE, revision=2) as watch:
         session = PythonSession(watch)
         session.run(SETUP + "d = Artemis.display\nd.fill_rect(0, 0, 10, 20, d.Color.Red)\nd.commit()")
@@ -224,13 +224,13 @@ def test_display_is_upright_on_revision_2():
         assert pixels[19 * 128 + 10] == (0, 0, 0)
 
 
-def test_text_reaches_the_display(micropython):
+def test_display_text_rendering(micropython):
     micropython.run(SETUP + "d = Artemis.display\nd.text('Artemis', 10, 60, d.Color.White)\nd.commit()")
     lit = sum(1 for p in micropython.watch.pixels() if p == (255, 255, 255))
     assert lit > 50
 
 
-def test_backlight_follows_its_signal(micropython):
+def test_backlight_on_off(micropython):
     micropython.run(SETUP)
     micropython.run("Artemis.backlight.off()")
     assert micropython.watch.backlight == 0.0
@@ -319,7 +319,7 @@ def test_buzzer_plays_the_requested_tone(micropython):
     assert watch.buzzer[0] == 0
 
 
-def test_piezo_tone_stops_on_its_own(micropython):
+def test_piezo_tone_duration(micropython):
     watch = micropython.watch
     micropython.run(SETUP)
     seen = set()
@@ -337,7 +337,7 @@ def test_piezo_tone_stops_on_its_own(micropython):
 # Motion sensor and clock
 
 
-def test_i2c_bus_has_both_chips(micropython):
+def test_i2c_sensor_and_rtc_addresses(micropython):
     micropython.run(SETUP)
     assert set(evaluate(micropython, "Artemis.i2c.scan()")) == {0x51, 0x6A}
 
@@ -364,14 +364,14 @@ def test_gyroscope_reads_the_rotation(micropython):
     assert z == pytest.approx(-3.1416, abs=0.1)
 
 
-def test_rtc_reads_the_time_it_was_given(micropython):
+def test_rtc_initial_time(micropython):
     micropython.run(SETUP + "t = Artemis.rtc.get_time()")
     assert evaluate(micropython, "(t.year, t.month, t.day, t.hours, t.minutes)") == (
         2026, 7, 20, 20, 17,
     )
 
 
-def test_rtc_keeps_time_set_from_python(micropython):
+def test_rtc_advances_after_set_time(micropython):
     micropython.run(
         SETUP
         + """
@@ -402,7 +402,7 @@ read = lambda: sum(adc.read_uv() for _ in range(16)) // 16
     )
 
 
-def test_battery_voltage_reaches_the_adc(micropython):
+def test_battery_voltage_adc_reading(micropython):
     battery_read_setup(micropython)
     # The firmware's battery driver: 1:4 divider, 75 mV correction.
     assert evaluate(micropython, "read()") == pytest.approx((3900 - 75) / 4 * 1000, rel=0.02)
@@ -410,20 +410,20 @@ def test_battery_voltage_reaches_the_adc(micropython):
     assert evaluate(micropython, "read()") == pytest.approx((3400 - 75) / 4 * 1000, rel=0.02)
 
 
-def test_calibration_pin_switches_to_the_reference(micropython):
+def test_adc_calibration_reference(micropython):
     battery_read_setup(micropython)
     micropython.run("cal = Pin(4, Pin.OUT, value=1)")
     assert evaluate(micropython, "read()") == pytest.approx(2500 / 4 * 1000, rel=0.02)
 
 
-def test_usb_detect_pin_follows_the_cable(micropython):
+def test_usb_connection_detection(micropython):
     micropython.run("from machine import Pin\nusb = Pin(42, Pin.IN)")
     assert evaluate(micropython, "usb.value()") == 0
     micropython.watch.set_battery(usb=True)
     assert evaluate(micropython, "usb.value()") == 1
 
 
-def test_power_pin_cuts_power_and_the_button_restores_it(micropython):
+def test_power_off_and_button_restart(micropython):
     watch = micropython.watch
     rebooted = reboot_detector(watch)
     micropython.start("from machine import Pin\nPin(37, Pin.OUT, value=0)")
@@ -450,7 +450,7 @@ def test_machine_reset_reboots(micropython):
     assert evaluate(session, "__import__('machine').reset_cause() == __import__('machine').HARD_RESET")
 
 
-def test_panic_reboots_and_says_why(micropython):
+def test_panic_reboots_and_reports_cause(micropython):
     watch = micropython.watch
     rebooted = reboot_detector(watch)
     micropython.start("import machine\nmachine.mem32[0]")
@@ -472,7 +472,7 @@ def test_unfed_watchdog_restarts_the_watch(micropython):
     assert evaluate(session, "__import__('machine').reset_cause() == __import__('machine').WDT_RESET")
 
 
-def test_fed_watchdog_leaves_the_watch_running(micropython):
+def test_watchdog_feed_prevents_reset(micropython):
     watch = micropython.watch
     rebooted = reboot_detector(watch)
     micropython.run(
@@ -488,7 +488,7 @@ for _ in range(20):
     assert not rebooted()
 
 
-def test_watchdogs_can_be_turned_off():
+def test_watchdog_disable_option():
     with Watch(FIRMWARE, watchdogs=False) as watch:
         session = PythonSession(watch)
         rebooted = reboot_detector(watch)
@@ -497,7 +497,7 @@ def test_watchdogs_can_be_turned_off():
         assert not rebooted()
 
 
-def test_interrupts_kept_off_trip_the_interrupt_watchdog(micropython):
+def test_disabled_interrupts_trigger_watchdog(micropython):
     watch = micropython.watch
     rebooted = reboot_detector(watch)
     micropython.start(
@@ -621,7 +621,7 @@ button.irq(lambda p: None, Pin.WAKE_HIGH, wake=machine.SLEEP)
 # Radios: the stacks start and find nobody
 
 
-def test_wifi_can_be_turned_on_and_finds_nothing(micropython):
+def test_wifi_initialization_and_empty_scan(micropython):
     out = micropython.run(
         """
 import network
@@ -647,7 +647,7 @@ def test_bluetooth_turns_on_and_off(micropython):
 
 
 @pytest.mark.parametrize("delay_ms", [0, 5, 50, 300, 1000])
-def test_advertising_stops_when_asked_whenever_that_is(micropython, delay_ms):
+def test_ble_advertising_stop_at_varied_delays(micropython, delay_ms):
     out = micropython.run(
         BLE_SETUP
         + f"""
@@ -662,7 +662,7 @@ print("stopped")
     assert out.strip() == "stopped"
 
 
-def test_scanning_finishes_and_finds_nobody(micropython):
+def test_ble_scan_completes_without_results(micropython):
     out = micropython.run(
         BLE_SETUP
         + """
@@ -677,7 +677,7 @@ print(5 in events, 6 in events)  # _IRQ_SCAN_RESULT, _IRQ_SCAN_DONE
     assert out.split() == ["False", "True"]
 
 
-def test_connecting_to_nobody_times_out(micropython):
+def test_ble_connection_attempt_without_peer(micropython):
     out = micropython.run(
         BLE_SETUP
         + """
@@ -695,7 +695,7 @@ print(7 in events)  # _IRQ_PERIPHERAL_CONNECT
     assert out.split()[-1] == "False"
 
 
-def test_a_gatt_server_can_be_registered(micropython):
+def test_gatt_service_registration_and_readback(micropython):
     out = micropython.run(
         BLE_SETUP
         + """
@@ -747,7 +747,7 @@ def test_installed_main_runs_after_a_power_cycle(micropython):
     watch.wait_for_output("hello from main.py", timeout=30)
 
 
-def test_files_outlive_the_emulator_with_a_flash_file(tmp_path):
+def test_filesystem_persists_between_runs(tmp_path):
     flash = tmp_path / "flash.bin"
     with Watch(FIRMWARE, flash_file=flash) as watch:
         PythonSession(watch).write_file("note.txt", b"remember me")
@@ -756,7 +756,7 @@ def test_files_outlive_the_emulator_with_a_flash_file(tmp_path):
         assert PythonSession(watch).run("print(open('note.txt').read())").strip() == "remember me"
 
 
-def test_runs_with_a_set_clock_and_supply():
+def test_initial_clock_and_power_options():
     when = dt.datetime(2030, 2, 3, 4, 5, 6)
     with Watch(FIRMWARE, time=when, battery_mv=3700, usb=True) as watch:
         session = PythonSession(watch)

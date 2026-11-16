@@ -1,5 +1,5 @@
 """
-What a real watch does, which the emulator has to do too.
+Hardware comparison tests for timing, peripherals, and reset behavior.
 
 The figures here were measured on a watch (hardware revision 2, on USB, lying flat) running
 this project's MicroPython firmware. To run the same tests on a watch instead, plug one in
@@ -7,7 +7,7 @@ with that firmware on it and set ARTEMIS_TEST_ON_WATCH=1 (and ARTEMIS_WATCH_PORT
 are plugged in):
 
     artemis-emu device flash micropython
-    ARTEMIS_TEST_ON_WATCH=1 python -m pytest tests/test_like_a_watch.py
+    ARTEMIS_TEST_ON_WATCH=1 python -m pytest tests/test_hardware_comparison.py
 """
 
 import ast
@@ -120,7 +120,7 @@ def us(fn, n):
 
 
 @pytest.mark.parametrize("mhz, expected_us", [(240, 70840), (160, 106256), (80, 212645)])
-def test_a_loop_takes_as_long_as_on_a_watch(python, mhz, expected_us):
+def test_loop_execution_time(python, mhz, expected_us):
     took = measure(python, WORKLOADS + f"""
 machine.freq({mhz} * 1000000)
 print(min(us(loop, 30000) for _ in range(3)))
@@ -135,13 +135,13 @@ print(min(us(loop, 30000) for _ in range(3)))
     ("lists, 2000", 52450),
     ("drawing, 20", 22185),
 ])
-def test_other_work_takes_about_as_long_as_on_a_watch(python, workload, expected_us):
+def test_workload_execution_time(python, workload, expected_us):
     took = measure(python, WORKLOADS + f"print(us({workload}))")
     # Work that leans on memory runs up to 8% fast: the chip's cache misses aren't modelled.
     assert within(took, expected_us, 0.12)
 
 
-def test_the_cycle_counter_runs_at_the_cpu_frequency(python):
+def test_cycle_counter_frequency(python):
     rates = measure(python, """
 import time, machine
 out = []
@@ -206,7 +206,7 @@ base = ns(plain)
 """
 
 
-def test_reading_a_register_costs_what_it_does_on_a_watch(python):
+def test_register_read_latency(python):
     extra = measure(python, REGISTER_LOOPS + """
 print({name: ns(read, a) - base for name, a in (
     ("memory", 0x3FC90000), ("gpio", 0x60004004), ("systimer", 0x60023044),
@@ -218,7 +218,7 @@ print({name: ns(read, a) - base for name, a in (
         assert abs(extra[name] - ns) <= 20, (name, extra)
 
 
-def test_writing_a_register_costs_what_it_does_on_a_watch(python):
+def test_register_write_latency(python):
     extra = measure(python, REGISTER_LOOPS + """
 print({name: ns(write, a) - base for name, a in (("gpio", 0x60004008), ("rtc", 0x60008050))})
 """)
@@ -226,7 +226,7 @@ print({name: ns(write, a) - base for name, a in (("gpio", 0x60004008), ("rtc", 0
     assert abs(extra["rtc"] - 204) <= 25, extra
 
 
-def test_code_is_no_slower_the_first_time_it_runs(python):
+def test_first_call_latency(python):
     # A NeoPixel write goes through a driver nothing else has used yet.
     first, later = measure(python, """
 import time, machine
@@ -244,7 +244,7 @@ print((first, min(us() for _ in range(5))))
 # ---------------------------------------------------------------------------------------
 # Time
 
-def test_sleeps_end_when_they_do_on_a_watch(python):
+def test_sleep_duration(python):
     means = measure(python, """
 import time
 def mean(fn, arg, n):
@@ -259,7 +259,7 @@ print((mean(time.sleep_us, 300, 20), mean(time.sleep_ms, 5, 20), mean(time.sleep
         assert asked <= took <= asked + 120, means
 
 
-def test_hardware_timers_keep_their_period(python):
+def test_hardware_timer_periods(python):
     counts = measure(python, """
 import time
 from machine import Timer
@@ -338,7 +338,7 @@ GATED = {
 }
 
 
-def test_a_peripheral_without_its_clock_or_in_reset_ignores_writes(python):
+def test_peripheral_clock_gating_and_reset(python):
     calls = ", ".join(f"{name!r}: {call}" for name, (call, _) in GATED.items())
     seen = measure(python, GATING + f"print({{{calls}}})")
     assert seen == {name: columns for name, (_, columns) in GATED.items()}
@@ -428,7 +428,7 @@ def read_registers(python):
     return dict(line.split() for line in output.splitlines() if "+" in line)
 
 
-def test_registers_read_as_they_do_on_a_watch(python):
+def test_register_values_after_boot(python):
     """After MicroPython has started and before it has been asked for anything."""
     expected = dict(line.split() for line in WATCH_REGISTERS.read_text().splitlines()
                     if line and not line.startswith("#"))
@@ -445,7 +445,7 @@ def test_registers_read_as_they_do_on_a_watch(python):
 # ---------------------------------------------------------------------------------------
 # Parts the watch has no use for, which still have to behave
 
-def test_neopixel_data_takes_the_time_it_takes_on_the_wire(python):
+def test_neopixel_transmission_time(python):
     took = measure(python, """
 import time, machine
 from machine import Pin
@@ -464,7 +464,7 @@ print(out)
         assert expected_us - 150 <= took[count] <= expected_us + 350, took
 
 
-def test_a_neopixel_strip_can_be_written(python):
+def test_neopixel_write(python):
     assert python.run("""
 import neopixel
 from machine import Pin
@@ -475,7 +475,7 @@ print("written")
 """).strip() == "written"
 
 
-def test_rmt_sends_pulses_for_as_long_as_they_last(python):
+def test_rmt_transmission_time(python):
     early, done, ms = measure(python, """
 import time, esp32
 from machine import Pin
@@ -508,7 +508,7 @@ def ms(fn, buf):
     ("16, I2S.STEREO, 44100", 17640, ["6f3de38f", "3400000e", "00107a4c", "00010003"]),
     ("32, I2S.MONO, 22050", 8820, ["7f7fe19f", "3400001c", "00051298", "00010001"]),
 ])
-def test_i2s_plays_at_the_sample_rate(python, settings, count, clocks):
+def test_i2s_playback_sample_rate(python, settings, count, clocks):
     first, second, seen, state = measure(python, I2S + f"""
 bits, fmt, rate = {settings}
 a = I2S(0, sck=Pin(8), ws=Pin(9), sd=Pin(10), mode=I2S.TX, bits=bits, format=fmt, rate=rate, ibuf=20000)
@@ -526,7 +526,7 @@ a.deinit()
     assert 198 <= first[1] + second[1] <= 240, (first, second)
 
 
-def test_i2s_records_silence_at_the_sample_rate(python):
+def test_i2s_recording_sample_rate_and_silence(python):
     first, second, silent, seen = measure(python, I2S + """
 a = I2S(0, sck=Pin(8), ws=Pin(9), sd=Pin(10), mode=I2S.RX, bits=16, format=I2S.MONO, rate=16000, ibuf=20000)
 buf = bytearray(3200)
@@ -543,7 +543,7 @@ a.deinit()
     assert 92 <= second[1] <= 106 and 98 <= first[1] <= 135, (first, second)
 
 
-def test_touch_pads_read_like_bare_pads(python):
+def test_touch_pad_baselines(python):
     counts = measure(python, """
 from machine import Pin, TouchPad
 print([TouchPad(Pin(n)).read() for n in (8, 9, 10, 11)])
@@ -552,7 +552,7 @@ print([TouchPad(Pin(n)).read() for n in (8, 9, 10, 11)])
     assert all(10500 <= count <= 13000 for count in counts), counts
 
 
-def test_uart_and_spi_lines_tied_to_themselves(python):
+def test_uart_shared_pin_and_spi_undriven_input(python):
     uart, spi, spi_ms = measure(python, """
 import time
 from machine import Pin, UART, SPI
@@ -581,7 +581,7 @@ print((uart, bytes(buf), spi_ms))
     (115200, 200, [0x0030015B, 0x03700000]),
     (921600, 1000, [0x0060002B, 0x03700000]),
 ])
-def test_uart_bytes_take_their_time_on_the_wire(python, baud, count, dividers):
+def test_uart_transmission_time(python, baud, count, dividers):
     write_us, drain_us, seen = measure(python, f"""
 import time
 from machine import UART, Pin, mem32
@@ -601,7 +601,7 @@ u.deinit()
 # ---------------------------------------------------------------------------------------
 # The watch's own parts
 
-def test_the_library_starts_as_fast_as_on_a_watch(python):
+def test_artemis_initialization_and_display_commit_time(python):
     import_ms, begin_ms, commit_us = measure(python, """
 import time
 t0 = time.ticks_us()
@@ -620,7 +620,7 @@ print((time.ticks_diff(t1, t0) // 1000, time.ticks_diff(t2, t1) // 1000, time.ti
     assert within(commit_us, 18236, 0.08)
 
 
-def test_battery_sense_on_usb_and_its_reference(python):
+def test_usb_battery_sense_and_reference_voltage(python):
     battery_mv, reference_mv = measure(python, """
 import time
 from machine import Pin, ADC
@@ -640,7 +640,7 @@ print((battery, reference))
     assert 605 <= reference_mv <= 635
 
 
-def test_pads_and_pulls(python):
+def test_gpio_input_levels_and_pulls(python):
     pins, pulled = measure(python, """
 import time
 from machine import Pin, ADC
@@ -677,7 +677,7 @@ wr(0x12, 0x44)                             # BDU, IF_INC
 """
 
 
-def test_motion_sensor_samples_at_its_rates(python):
+def test_motion_sensor_sample_rates(python):
     first_ms, rates, norm = measure(python, MOTION_SENSOR + """
 def rate():
     n = 0
@@ -776,7 +776,7 @@ wr(0x12, 0x01)
     }
 
 
-def test_pwm_changes_take_effect_at_the_end_of_a_period(python):
+def test_pwm_updates_at_period_boundary(python):
     seen = measure(python, """
 import time
 from machine import Pin, PWM, mem32
@@ -881,7 +881,7 @@ def reset_by(python, code):
     ("wdt(0, 15000, 3, 30000)", 0x249, 200),    # a stage that does nothing takes no time
     ("wdt(1, 15000, 3, 30000)", 0x249, 400),    # an interrupt first, then the reset
 ])
-def test_the_rtc_watchdog_resets_when_its_time_is_up(python, arm, state, elapsed_ms):
+def test_rtc_watchdog_reset_timing(python, arm, state, elapsed_ms):
     session = reset_by(python, RTC_WATCHDOG + arm + "\nrun_until_reset()")
     cause, seen, ms, _ = measure(session, AFTER_RESET)
     assert (cause, seen) == (3, state)
@@ -889,7 +889,7 @@ def test_the_rtc_watchdog_resets_when_its_time_is_up(python, arm, state, elapsed
     assert abs(ms - elapsed_ms) <= max(6, elapsed_ms * 0.02)
 
 
-def test_feeding_the_rtc_watchdog_holds_it_off(python):
+def test_rtc_watchdog_feed_prevents_reset(python):
     session = reset_by(python, RTC_WATCHDOG + """
 wdt(3, 30000)
 for _ in range(10):
@@ -901,7 +901,7 @@ run_until_reset()
     assert abs(ms - 399) <= 10
 
 
-def test_the_rtc_watchdog_is_locked_without_its_key(python):
+def test_rtc_watchdog_write_protection(python):
     seen = measure(python, RTC_WATCHDOG + """
 wdt(0, 15000)
 mem32[R + 0x98] = 1 << 31 | 3 << 28
@@ -917,7 +917,7 @@ print((locked, key, mem32[R + 0x98] & 0xFFFFFFFF))
     assert seen == ([0x8007EE00, 15000, 0, 0], 0x50D83AA1, 0x7EE00)
 
 
-def test_the_rtc_watchdog_can_reset_the_whole_chip(python):
+def test_rtc_watchdog_chip_reset(python):
     python.run("from machine import mem32\nmem32[0x60008050] = 1234")
     session = reset_by(python, RTC_WATCHDOG + "wdt(4, 15000)\nwhile True: pass")
     cause, state, store, now = measure(session, AFTER_RESET)
@@ -925,7 +925,7 @@ def test_the_rtc_watchdog_can_reset_the_whole_chip(python):
     assert now <= 3                             # its clock starts again
 
 
-def test_a_software_reset_leaves_the_rtc_domain_alone(python):
+def test_software_reset_preserves_rtc_state(python):
     before = measure(python, """
 import time
 from machine import mem32
@@ -939,7 +939,7 @@ print(time.time())
     assert before <= now <= before + 3          # and the clock carries on
 
 
-def test_the_bootloader_and_firmware_leave_the_rtc_watchdog_set_up_and_off(python):
+def test_rtc_watchdog_configuration_after_boot(python):
     seen = measure(python, """
 from machine import mem32
 print([mem32[0x60008000 + o] & 0xFFFFFFFF for o in (0x98, 0x9C, 0xB0)])
@@ -962,7 +962,7 @@ def record_watch_registers(resets=6):
     WATCH_REGISTERS.write_text(
         "# ESP32-S3 registers as a watch (hardware revision 2, on USB) has them once MicroPython\n"
         "# has started: those that read the same after every whole-chip reset. Written, with a watch\n"
-        "# plugged in, by: python -m tests.test_like_a_watch\n"
+        "# plugged in, by: python -m tests.test_hardware_comparison\n"
         + "".join(f"{name} {dumps[0][name]}\n" for name in stable))
     print(f"{len(stable)} of {len(dumps[0])} registers are stable")
 

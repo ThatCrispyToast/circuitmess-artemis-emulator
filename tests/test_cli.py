@@ -41,25 +41,25 @@ def script(tmp_path, code, name="script.py"):
     return str(path)
 
 
-def test_python_prints_what_the_script_prints_and_nothing_else(tmp_path):
+def test_python_stdout_contains_only_script_output(tmp_path):
     result = emu("python", script(tmp_path, "print('from the watch')"), *HEADLESS)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "from the watch"
 
 
-def test_python_failure_gives_a_traceback_and_an_exit_code(tmp_path):
+def test_python_error_traceback_and_exit_code(tmp_path):
     result = emu("python", script(tmp_path, "raise ValueError('nope')"), *HEADLESS)
     assert result.returncode == 1
     assert "ValueError: nope" in result.stderr
 
 
-def test_python_reports_a_script_that_never_ends(tmp_path):
+def test_python_reports_script_timeout(tmp_path):
     result = emu("python", script(tmp_path, "while True:\n    pass"), *HEADLESS, "--timeout", "2")
     assert result.returncode == 1
     assert "still running" in result.stderr
 
 
-def test_python_reports_a_script_that_restarts_the_watch(tmp_path):
+def test_python_reports_script_reset(tmp_path):
     result = emu("python", script(tmp_path, "import machine\nmachine.reset()"), *HEADLESS)
     assert result.returncode == 1
     assert "--install" in result.stderr
@@ -78,7 +78,7 @@ def test_python_takes_a_screenshot(tmp_path):
     assert is_png(shot)
 
 
-def test_install_keeps_running_across_runs_with_a_flash_file(tmp_path):
+def test_installed_script_persists_between_runs(tmp_path):
     flash = tmp_path / "flash.bin"
     result = emu(
         "python", script(tmp_path, "print('installed and running')"),
@@ -134,7 +134,7 @@ def test_repl_is_interactive():
         os.close(controller)
 
 
-def test_gdb_stub_holds_the_watch_until_told_to_continue():
+def test_gdb_waits_for_continue():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
@@ -171,7 +171,7 @@ def test_gdb_stub_holds_the_watch_until_told_to_continue():
 
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP, signal.SIGKILL])
-def test_emulator_does_not_outlive_the_command(tmp_path, signum):
+def test_qemu_exits_with_parent_process(tmp_path, signum):
     process = subprocess.Popen(
         [sys.executable, "-m", "artemis_emu", "repl", *HEADLESS],
         stdin=subprocess.DEVNULL,
@@ -234,7 +234,7 @@ def test_run_accepts_a_merged_image(stock_image, tmp_path):
     boots(STOCK, tmp_path)
 
 
-def test_run_puts_a_bare_app_behind_the_stock_bootloader(stock_image, tmp_path):
+def test_run_uses_stock_bootloader_for_bare_app(stock_image, tmp_path):
     app = tmp_path / "app.bin"
     app.write_bytes(stock_image[APP_OFFSET : APP_OFFSET + app_size(stock_image)])
     boots(app, tmp_path)
@@ -260,7 +260,7 @@ def test_run_accepts_an_esp_idf_build_directory(stock_image, tmp_path):
     boots(tmp_path / "project", tmp_path)
 
 
-def test_flash_image_is_always_the_size_of_the_flash_chip(stock_image):
+def test_flash_image_size(stock_image):
     assert len(build_flash_image(STOCK)) == FLASH_SIZE
 
 
@@ -272,7 +272,7 @@ def test_flash_image_is_always_the_size_of_the_flash_chip(stock_image):
         (b"not firmware", "isn't an ESP32 firmware image"),
     ],
 )
-def test_run_explains_what_it_cannot_use(tmp_path, content, complaint):
+def test_run_reports_invalid_firmware(tmp_path, content, complaint):
     bad = tmp_path / "bad.bin"
     bad.write_bytes(content)
     with pytest.raises(FirmwareError, match=complaint):
